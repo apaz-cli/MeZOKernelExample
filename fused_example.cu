@@ -6,7 +6,7 @@
  *            W_gate : [d, I]   (shared across batch)
  *            out    : [B, M, I]
  *
- * Compile:  nvcc -arch=sm_75 -O2 fused_example.cu -o fused_example
+ * Compile:  nvcc -arch=sm_89 -O2 fused_example.cu -o fused_example
  * Run:      ./fused_example
  */
 
@@ -28,195 +28,179 @@ inline void gpuAssert(cudaError_t code, const char *file, int line) {
 // ---------------------------------------------------------------------------
 // Fused kernel: layernorm(silu(inp @ W_gate))
 //
-// Why tiling?
-//   GPU global memory (DRAM) costs ~200 cycles per access; shared memory —
-//   a small, fast scratchpad on-chip shared by all threads in a block — costs
-//   ~4 cycles.  The strategy: all 256 threads cooperatively load a narrow
-//   strip of inp rows and W_gate columns into shared memory at once, compute
-//   partial dot products from those cached copies, then advance to the next
-//   strip.  Repeating across all strips accumulates the full dot product
-//   while reading each weight from DRAM only once.
+// Tile hierarchy (CUTLASS framing)
+//   Block tile  TILE_M × TILE_N:  what this threadblock is responsible for
+//   Thread tile 1     × THREAD_N: what each thread holds in registers
+//   BLOCK_THREADS     = TILE_M × (TILE_N / THREAD_N)   (derived, not set directly)
+//
+//   In a production kernel the thread tile would be replaced by a warp tile
+//   (Ampere mma.sync) or warpgroup tile (Hopper wgmma / Blackwell tcgen05).
+//   The block tile and K-loop structure are identical across all three.
 //
 // Thread assignment
-//   256 threads per block are arranged as a logical 4×64 grid:
-//     m_local = threadIdx.x / 64  — which of the 4 output rows this thread owns
-//     n_local = threadIdx.x % 64  — which column within that row (0–63)
-//   Thread t is solely responsible for output element (m_local, n_local) in
-//   each N-strip, and for the same column during LayerNorm.
+//   256 threads per block, laid out as TILE_M rows × (TILE_N/THREAD_N) cols:
+//     m_local = t / (TILE_N/THREAD_N)  — which of the 4 output rows
+//     n_local = t % (TILE_N/THREAD_N)  — which column group (0–63)
+//   Thread t owns output columns  n_local*THREAD_N .. n_local*THREAD_N+THREAD_N-1
+//   within each N-tile, and the same columns during LayerNorm.
 //
-// Grid:  dim3(ceil(M/TILE_M), B)  — one block per (row-tile, batch element)
-// Block: BLOCK_THREADS = TILE_M * TILE_N threads (256 = 4 rows × 64 cols)
+// Grid:  dim3(ceil(M/TILE_M), B)
 //
-// Shared memory layout:
+// Shared memory layout (~33 KB total):
 //   inp_tile [TILE_M × TILE_K floats]  input strip      (1 KB)
-//   w_tile   [TILE_K × TILE_N halfs]   weight strip     (8 KB)
-//   silu_buf [TILE_M × I floats]       dot product sums (8 KB)
+//   w_tile   [TILE_K × TILE_N halfs]   weight strip     (32 KB)
 //   smem2    [TILE_M*2 float2]         warp-leader stats (64 B)
 //
+// w_tile is stored as half: with THREAD_N=4 each thread reads four consecutive
+// halfs per ki step (stride-4 access), giving 2-way bank conflicts.  Storing
+// as float would give 4-way conflicts for the same access pattern.  Half is
+// the better choice here; this is the same trade-off as in the ZO kernel.
+//
 // Steps:
-//   1. Tiled GEMM: load inp and W_gate strips into shared memory; accumulate
-//      partial dot products into silu_buf; repeat across all K and N strips.
-//   2. SiLU + stats: apply SiLU; each thread accumulates partial (Σv, Σv²)
-//      for its row using warp shuffles — threads within a 32-thread warp
-//      exchange register values directly, no memory needed.
-//   3. Normalize: apply (v − mean)/std * γ + β from register-cached values;
-//      write fp16 output.
+//   1. Tiled GEMM (K-outer, N-inner): load inp strip once per K-tile; for each
+//      N-tile load the weight strip and accumulate THREAD_N partial dot products
+//      per thread into register array v_cache.
+//   2. SiLU in-place on v_cache; warp-shuffle reduction for per-row (Σv, Σv²).
+//   3. Normalize from v_cache; write fp16 output.
 // ---------------------------------------------------------------------------
 #define TILE_M        4
 #define TILE_K        64
-#define TILE_N        64
-#define BLOCK_THREADS 256
+#define TILE_N        256
+#define THREAD_N      4
+#define BLOCK_THREADS (TILE_M * TILE_N / THREAD_N)   // = 256
 #define I_DIM         4096  // hidden (intermediate) dimension
 #define LAYERNORM_EPS 1e-5f
 
 // ---------------------------------------------------------------------------
 // Hyperparameter constraints
 //
-// BLOCK_THREADS == TILE_M * TILE_N
-//   Thread decomposition t = m_local * TILE_N + n_local maps each thread to
-//   exactly one output element.  TILE_M rows × TILE_N threads/row = total
-//   block size.
+// BLOCK_THREADS == TILE_M * TILE_N / THREAD_N   (derived)
+//   Thread decomposition: m_local = t / (TILE_N/THREAD_N),
+//                         n_local = t % (TILE_N/THREAD_N).
+//   Block size follows from the tile dimensions; it is not set independently.
 //
-// TILE_K == TILE_N   (follows from the above + A-tile load)
-//   The A-tile [TILE_M × TILE_K] is loaded as inp_tile[t], one element per
-//   thread.  The tile has TILE_M * TILE_K elements; the block has
-//   BLOCK_THREADS = TILE_M * TILE_N threads, so TILE_K must equal TILE_N.
-//   Violating this overflows or underloads inp_tile, corrupting w_tile.
+// TILE_N / THREAD_N == 64   (warp-shuffle epilogue hardcodes 2 warps/row)
+//   threads_per_row = TILE_N / THREAD_N must be 64 so that each row spans
+//   exactly 2 warps and smem2[m_local*2 + t_r/32] is correctly indexed.
+//   Changing this requires rewriting the epilogue reduction.
 //
-// TILE_N == 64   (warp-shuffle epilogue hardcodes 2 warps/row)
-//   After the intra-warp butterfly, exactly 2 warp leaders per row write to
-//   smem2[m_local*2 + t_r/32].  Changing TILE_N to 32 (1 warp) or 128
-//   (4 warps) requires rewriting the epilogue indices and smem2 sizing.
+// TILE_K: free parameter, not constrained to equal TILE_N
+//   The A-tile is loaded as a strided cooperative loop over TILE_M×TILE_K
+//   elements; TILE_K can be set independently of TILE_N.  For efficiency,
+//   TILE_M×TILE_K should be a multiple of BLOCK_THREADS.
 //
 // I % TILE_N == 0
-//   The N-tile loop loads w_gate[k*I + n_start+ni] and writes
-//   silu_buf[m_local*I + n_start+n_local] with no column-direction bounds
-//   guard.  If I is not a multiple of TILE_N, the last N-tile accesses
-//   w_gate and silu_buf out of bounds.
+//   The N-tile loop has no column-direction bounds guard.
 //
-// I_DIM / TILE_N == I at runtime   (v_cache compile-time size)
-//   float v_cache[I_DIM / TILE_N] is compile-time sized.  I_DIM must match
-//   the I passed to the kernel; if they differ the cache is undersized or
-//   wastes registers.
+// I_DIM == I at runtime   (v_cache compile-time size)
+//   float v_cache[(I_DIM/TILE_N)*THREAD_N] is compile-time sized.
 //
 // d % TILE_K: not required
-//   Both the A-tile load (r < M && k < d) and B-tile load (k < d) are
-//   guarded, so partial K-tiles are correctly zero-padded.
+//   A-tile and B-tile loads are guarded by (k < d).
 //
 // M % TILE_M: not required
-//   The output write is guarded by (row < M); out-of-bounds tiles produce
-//   zero-padded stats but never write output.
+//   Output write is guarded by (row < M).
 //
 // Hardware limits
-//   BLOCK_THREADS <= 1024 (max threads/block).
-//   shm_bytes <= 49152 by default (48 KB); up to 98304 on sm_75+ with
-//   cudaFuncSetAttribute(f, cudaFuncAttributeMaxDynamicSharedMemorySize, N).
+//   BLOCK_THREADS <= 1024.
+//   shm_bytes ≈ 33 KB < 48 KB default; no cudaFuncSetAttribute needed.
 // ---------------------------------------------------------------------------
 
 __global__ void layernorm_silu_matmul_kernel(
-    half       *out,
-    const half *inp,
-    const half *w_gate,
-    const half *w_norm,
-    const half *b_norm,
+    half       * __restrict__ out,
+    const half * __restrict__ inp,
+    const half * __restrict__ w_gate,
+    const half * __restrict__ w_norm,
+    const half * __restrict__ b_norm,
     int B, int M, int d, int I)
 {
-    // One dynamic shared memory allocation, manually partitioned into regions:
+    // One dynamic shared memory allocation, manually partitioned:
     extern __shared__ char smem_raw[];
     float  *inp_tile = (float *)smem_raw;
     half   *w_tile   = (half  *)(smem_raw + TILE_M * TILE_K * sizeof(float));
-    float  *silu_buf = (float *)(smem_raw + TILE_M * TILE_K * sizeof(float)
-                                          + TILE_K * TILE_N * sizeof(half));
     float2 *smem2    = (float2 *)(smem_raw + TILE_M * TILE_K * sizeof(float)
-                                           + TILE_K * TILE_N * sizeof(half)
-                                           + TILE_M * I * sizeof(float));
+                                           + TILE_K * TILE_N * sizeof(half));
 
-    const int tile_row = blockIdx.x;
-    const int batch    = blockIdx.y;
-    const int t        = threadIdx.x;
+    const int tile_row        = blockIdx.x;
+    const int batch           = blockIdx.y;
+    const int t               = threadIdx.x;
+    const int threads_per_row = TILE_N / THREAD_N;   // = 64
 
-    // Map flat thread index to a 2D position within the output tile.
-    // m_local: which of the TILE_M rows  (0 – TILE_M-1)
-    // n_local: which column within a row (0 – TILE_N-1)
-    const int m_local = t / TILE_N;
-    const int n_local = t % TILE_N;
-    const int row     = tile_row * TILE_M + m_local;  // global row in inp/out
+    // Thread tile decomposition.
+    const int m_local = t / threads_per_row;
+    const int n_local = t % threads_per_row;   // column-group index within row
+    const int row     = tile_row * TILE_M + m_local;
 
     // ----------------------------------------------------------------
-    // Step 1: tiled GEMM
+    // Step 1: tiled GEMM — K-outer, N-inner.
+    //
+    // v_cache[(I/TILE_N)*THREAD_N] holds the full dot products for this
+    // thread's THREAD_N output columns across all N-tiles.  ci advances by
+    // THREAD_N each N-tile; within a tile j=0..THREAD_N-1 indexes the columns.
+    //
+    // The A-tile is loaded as a strided cooperative loop so that TILE_K is
+    // independent of BLOCK_THREADS and the thread-tile decomposition.
     // ----------------------------------------------------------------
-
-    // Zero silu_buf before accumulating partial dot products into it.
-    for (int idx = t; idx < TILE_M * I; idx += BLOCK_THREADS)
-        silu_buf[idx] = 0.f;
-    __syncthreads();  // all writes must finish before any thread reads silu_buf
+    float v_cache[(I_DIM / TILE_N) * THREAD_N] = {};
 
     for (int k_start = 0; k_start < d; k_start += TILE_K) {
-        // Cooperatively load a TILE_M×TILE_K strip of inp into shared memory.
-        // With BLOCK_THREADS = TILE_M*TILE_K, each thread loads exactly one element.
-        {
-            int mi = t / TILE_K, ki = t % TILE_K;
+        // Cooperatively load TILE_M × TILE_K input strip.
+        for (int idx = t; idx < TILE_M * TILE_K; idx += BLOCK_THREADS) {
+            int mi = idx / TILE_K, ki = idx % TILE_K;
             int r  = tile_row * TILE_M + mi;
             int k  = k_start + ki;
-            inp_tile[t] = (r < M && k < d)
-                ? __half2float(inp[(batch * M + r) * d + k]) : 0.f;
+            inp_tile[idx] = (r < M && k < d)
+                ? __half2float(__ldg(&inp[(batch * M + r) * d + k])) : 0.f;
         }
-        __syncthreads();  // inp_tile must be fully written before anyone reads it
+        __syncthreads();
 
-        for (int n_start = 0; n_start < I; n_start += TILE_N) {
-            // Cooperatively load a TILE_K×TILE_N strip of W_gate into shared memory.
-            // Adjacent threads load adjacent columns — "coalesced" access merges
-            // them into fewer, wider DRAM transactions.
+        for (int n_start = 0, ci = 0; n_start < I; n_start += TILE_N, ci += THREAD_N) {
+            // Cooperatively load TILE_K × TILE_N weight strip.
             for (int idx = t; idx < TILE_K * TILE_N; idx += BLOCK_THREADS) {
                 int ki = idx / TILE_N, ni = idx % TILE_N;
                 int k  = k_start + ki;
-                w_tile[idx] = (k < d) ? w_gate[k * I + n_start + ni]
+                w_tile[idx] = (k < d) ? __ldg(&w_gate[k * I + n_start + ni])
                                       : __float2half(0.f);
             }
-            __syncthreads();  // w_tile must be ready before the dot product loop
+            __syncthreads();
 
-            // Each thread accumulates its partial dot product for element
-            // (m_local, n_start+n_local) of the output.
-            float dot = 0.f;
-            for (int ki = 0; ki < TILE_K; ki++)
-                dot += inp_tile[m_local * TILE_K + ki]
-                     * __half2float(w_tile[ki * TILE_N + n_local]);
-            silu_buf[m_local * I + n_start + n_local] += dot;
-            __syncthreads();  // silu_buf writes must finish before next w_tile load
+            // Each thread accumulates THREAD_N dot products for its column group.
+            float dot[THREAD_N] = {};
+            #pragma unroll 4
+            for (int ki = 0; ki < TILE_K; ki++) {
+                float a = inp_tile[m_local * TILE_K + ki];
+                const half *wt = w_tile + ki * TILE_N + n_local * THREAD_N;
+                #pragma unroll
+                for (int j = 0; j < THREAD_N; j++)
+                    dot[j] += a * __half2float(wt[j]);
+            }
+            #pragma unroll
+            for (int j = 0; j < THREAD_N; j++)
+                v_cache[ci + j] += dot[j];
+
+            __syncthreads();
         }
     }
 
     // ----------------------------------------------------------------
-    // Step 2: SiLU + per-row stats for LayerNorm
-    // Read each accumulated dot product, apply SiLU, and collect the
-    // per-row sums (Σv) and (Σv²) needed to compute mean and variance.
-    // v_cache keeps the post-SiLU values in registers so step 3 doesn't
-    // need to re-read silu_buf.
+    // Step 2: SiLU in-place on v_cache; collect per-row stats (Σv, Σv²).
     // ----------------------------------------------------------------
-    const int t_r = n_local;   // this thread's index within its row's 64-thread slice
+    const int t_r = n_local;
 
-    float v_cache[I_DIM / TILE_N];
     float2 local = {0.f, 0.f};
-    for (int ci = 0, n = t_r; n < I; n += TILE_N, ++ci) {
-        float g = silu_buf[m_local * I + n];
+    for (int ci = 0; ci < (I_DIM / TILE_N) * THREAD_N; ++ci) {
+        float g = v_cache[ci];
         float v = g / (1.f + expf(-g));
         v_cache[ci] = v;
         local.x += v;
         local.y += v * v;
     }
 
-    // Warp reduction: the GPU executes threads in hardware groups of 32 called
-    // warps.  __shfl_xor_sync lets threads within a warp exchange register
-    // values directly — no shared memory, no synchronization needed.
-    // The XOR butterfly (offsets 16, 8, 4, 2, 1) is a standard parallel sum:
-    // after 5 steps every lane holds the sum of all 32 lanes in its warp.
+    // Warp-shuffle butterfly; each row spans exactly 2 warps (threads_per_row=64).
     for (int s = 16; s > 0; s >>= 1) {
         local.x += __shfl_xor_sync(0xffffffff, local.x, s);
         local.y += __shfl_xor_sync(0xffffffff, local.y, s);
     }
-    // Each row spans 2 warps.  Lane 0 of each warp (t_r % 32 == 0) holds the
-    // warp's total and writes it to shared memory.  After one __syncthreads(),
-    // every thread reads both slots and independently computes mean/variance.
     if (t_r % 32 == 0)
         smem2[m_local * 2 + t_r / 32] = local;
     __syncthreads();
@@ -226,14 +210,19 @@ __global__ void layernorm_silu_matmul_kernel(
     float inv_std = rsqrtf(agg.y / I - mean * mean + LAYERNORM_EPS);
 
     // ----------------------------------------------------------------
-    // Step 3: normalize from register cache; guard out-of-bounds rows
+    // Step 3: normalize from v_cache; write fp16 output.
     // ----------------------------------------------------------------
     if (row < M) {
         half *out_row = out + (batch * M + row) * I;
-        for (int ci = 0, n = t_r; n < I; n += TILE_N, ++ci) {
-            float norm = (v_cache[ci] - mean) * inv_std;
-            out_row[n] = __float2half(norm * __half2float(w_norm[n])
-                                          + __half2float(b_norm[n]));
+        for (int n_start = 0, ci = 0; n_start < I; n_start += TILE_N, ci += THREAD_N) {
+            int n_base = n_start + n_local * THREAD_N;
+            #pragma unroll
+            for (int j = 0; j < THREAD_N; j++) {
+                int n = n_base + j;
+                float norm = (v_cache[ci + j] - mean) * inv_std;
+                out_row[n] = __float2half(norm * __half2float(__ldg(&w_norm[n]))
+                                              + __half2float(__ldg(&b_norm[n])));
+            }
         }
     }
 }
@@ -290,10 +279,11 @@ int main() {
     const int n_norm = I;
     const int n_out  = B * M * I;
 
+    printf("\n");
     printf("=== layernorm(silu(inp @ W_gate)) ===\n");
     printf("  B=%d  M=%d  d=%d  I=%d\n", B, M, d, I);
-    printf("  TILE_M=%d  TILE_K=%d  TILE_N=%d  BLOCK_THREADS=%d\n\n",
-           TILE_M, TILE_K, TILE_N, BLOCK_THREADS);
+    printf("  TILE_M=%d  TILE_K=%d  TILE_N=%d  THREAD_N=%d  BLOCK_THREADS=%d\n\n",
+           TILE_M, TILE_K, TILE_N, THREAD_N, BLOCK_THREADS);
 
     half  *h_inp     = (half*) malloc(n_inp  * sizeof(half));
     half  *h_w_gate  = (half*) malloc(n_w    * sizeof(half));
@@ -325,14 +315,10 @@ int main() {
     checkCuda(cudaMemcpy(d_w_norm, h_w_norm, n_norm * sizeof(half), cudaMemcpyHostToDevice));
     checkCuda(cudaMemcpy(d_b_norm, h_b_norm, n_norm * sizeof(half), cudaMemcpyHostToDevice));
 
-    const int shm_bytes = TILE_M * TILE_K * sizeof(float)
-                        + TILE_K * TILE_N * sizeof(half)
-                        + TILE_M * I * sizeof(float)
-                        + TILE_M * 2 * sizeof(float2);
+    const int shm_bytes = TILE_M * TILE_K * sizeof(float)   // inp_tile
+                        + TILE_K * TILE_N * sizeof(half)    // w_tile
+                        + TILE_M * 2 * sizeof(float2);      // smem2
     dim3 grid((M + TILE_M - 1) / TILE_M, B);
-    checkCuda(cudaFuncSetAttribute(layernorm_silu_matmul_kernel,
-                                   cudaFuncAttributeMaxDynamicSharedMemorySize,
-                                   shm_bytes));
 
     // -----------------------------------------------------------------------
     // [1] Correctness check
@@ -359,7 +345,7 @@ int main() {
            abs_err, rel_err, rel_err < 5e-3f ? "PASS" : "FAIL");
     printf("  First 4 outputs — %4s  %16s  %16s\n", "idx", "CPU (fp32)", "GPU (fp16→fp32)");
     for (int i = 0; i < 4; i++)
-        printf("               — %-4d  %+15.8f  %+15.8f\n", i, h_out_ref[i], h_out_f32[i]);
+        printf("    %-4d  %+15.8f  %+15.8f\n", i, h_out_ref[i], h_out_f32[i]);
 
     // -----------------------------------------------------------------------
     // [2] Timing

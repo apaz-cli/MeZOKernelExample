@@ -18,20 +18,22 @@
  *   zo_update        — ZO weight update, regenerates z from the same seed
  *
  * Thread layout (zo_fused_forward):
- *   t = m_local * ZO_TPR + n_quarter.  Thread t owns 4 consecutive output
- *   columns n0 = n_start + 4*n_quarter for its own row m_local only.
- *   One Philox call per (weight-row k, n_quarter) yields 4 N(0,1) samples —
- *   all ZO_TILE_M rows use the same z for the same weight (shared perturbation).
- *   Register accumulators a[4] hold the partial dot products for m_local.
- *   Requires I % ZO_TILE_N == 0.
+ *   t = m_local * ZO_TPR + n_quarter.  Thread t owns THREAD_N consecutive output
+ *   columns n0 = n_start + THREAD_N*n_quarter for its own row m_local only.
+ *   THREAD_N/PHILOX_WIDTH Philox calls per (weight-row k, n_quarter) yield THREAD_N
+ *   N(0,1) samples total — all ZO_TILE_M rows use the same z for the same weight
+ *   (shared perturbation).  Register arrays v_cache_p/n[(I_DIM/ZO_TILE_N)*THREAD_N]
+ *   accumulate the full GEMM output for both perturbations; SiLU is applied
+ *   in-place after the loops.  Requires I % ZO_TILE_N == 0.
  *
  * Philox ILP:
- *   counter = k*(I/4) + n_start/4 + n_quarter uniquely addresses group (k, n0..n0+3).
- *   #pragma unroll 4 on the ki inner loop issues 4 independent Philox chains
- *   (distinct counters → no data dependence). The GPU pipelines their 7-round
- *   integer multiply chains in parallel, hiding Philox latency behind itself.
+ *   counter = k*(I/PHILOX_WIDTH) + n_start/PHILOX_WIDTH + n_quarter*(THREAD_N/PHILOX_WIDTH) + g
+ *   uniquely addresses the g-th group-of-4 within thread n_quarter's THREAD_N columns.
+ *   #pragma unroll 4 on the ki loop issues 4 independent counter chains (distinct k
+ *   values → no data dependence); the GPU pipelines their 7-round multiply chains in
+ *   parallel, hiding Philox latency behind itself.
  *
- * Compile: nvcc -arch=sm_75 -O2 fused_zo_example.cu -o fused_zo_example
+ * Compile: nvcc -arch=sm_89 -O2 fused_zo_example.cu -o fused_zo_example
  * Run:     ./fused_zo_example
  */
 
@@ -117,16 +119,18 @@ float4 philox_normal_4(unsigned long long seed, unsigned long long counter)
 // and accumulates MSE vs target into *loss_pos and *loss_neg.
 //
 // Thread assignment
-//   256 threads per block are arranged as a logical 4×64 grid:
-//     m_local   = t / ZO_TPR  — which of the 4 output rows this thread owns
-//     n_quarter = t % ZO_TPR  — which group of 4 consecutive columns (0–63)
-//   Thread t accumulates dot products for row m_local, columns n_quarter*4
-//   through n_quarter*4+3, and owns those same columns during LayerNorm.
+//   FWD_THREADS threads per block are arranged as a logical ZO_TILE_M × ZO_TPR grid:
+//     m_local   = t / ZO_TPR  — which of the ZO_TILE_M output rows this thread owns
+//     n_quarter = t % ZO_TPR  — which group of THREAD_N consecutive columns (0–ZO_TPR-1)
+//   Thread t accumulates dot products for row m_local, columns n_quarter*THREAD_N
+//   through n_quarter*THREAD_N+THREAD_N-1, and owns those same columns during LayerNorm.
 //
-// N-outer, K-inner (unlike the reference kernel): register accumulators a[4]
-//   stay alive across all K-strips for a fixed N-strip.  This is required
-//   because the Philox counter depends on both k and n, so the weight and z
-//   for a given output column must both be resolved inside the K loop.
+// Loop order — K-outer, N-inner (same as the reference kernel):
+//   inp_tile is loaded once per K-tile and reused across all N-tiles.
+//   Loading it inside the N-loop would reload it I/ZO_TILE_N times per K-tile.
+//   The Philox counter = k*(I/4) + n_start/4 + n_quarter depends on both k
+//   and n; since both are available in the K-outer/N-inner body there is no
+//   constraint on loop order from Philox.
 //
 // Grid:  dim3(ceil(M/ZO_TILE_M), B)  — one block per (row-tile, batch element)
 // Block: FWD_THREADS = ZO_TILE_M * ZO_TPR threads (256 = 4 rows × 64 threads)
@@ -141,87 +145,159 @@ float4 philox_normal_4(unsigned long long seed, unsigned long long counter)
 //   warp_mse_n [ZO_TILE_M*2 float]            = 32 B   warp-leader MSE for -
 //   Total: ~34.2 KB
 //
-// No silu_buf: each thread normalizes the same 4-consecutive columns it
-// computed in the GEMM (matching the Philox grouping), so post-SiLU values
-// live in the v_cache register array and never touch shared memory.
+// w_tile is stored as half (not float).  The dot-product access pattern reads
+// THREAD_N consecutive halves per thread, with a stride of THREAD_N between
+// adjacent threads in a warp.  With half storage, that stride is THREAD_N*2
+// bytes → THREAD_N/2 banks → (THREAD_N/2)-way conflicts.  THREAD_N=PHILOX_WIDTH=4
+// gives 2-way conflicts, the minimum possible for any multiple-of-4 THREAD_N.
+// Larger THREAD_N widens the stride and worsens conflicts.  Promoting to float
+// at any THREAD_N doubles all strides and doubles the conflict count.
+//
+// Post-SiLU values live in v_cache_p/n register arrays and never touch shared
+// memory, avoiding a large intermediate buffer.
+//
+// ---- Porting to Ampere / Hopper / Blackwell ---------------------------------
+//
+// Three changes are needed to make this a production kernel.  The concept is
+// the same on all three architectures; the hardware primitives differ.
+//
+// (1) Replace the scalar FMA inner loop with a tensor-core MMA instruction.
+//     Ampere:    mma.sync.aligned.m16n8k16.f32.f16.f16.f32
+//                per-warp (32 threads); each thread holds a fixed slice of the
+//                16×8 C-fragment, dictated by the PTX ISA.
+//     Hopper:    wgmma.mma_async — warpgroup-level (128 threads); B is read
+//                directly from shared memory; only C lives in registers.
+//     Blackwell: tcgen05.mma — warpgroup-level; C accumulates in tensor memory
+//                (tmem), a dedicated per-SM scratchpad separate from smem,
+//                relieving register pressure for large accumulators.
+//
+//     Our simple (m_local, n_quarter*THREAD_N) decomposition does not survive
+//     this change.  The thread→output mapping becomes hardware-dictated and
+//     non-contiguous; THREAD_N is replaced by the MMA instruction's tile shape.
+//
+// (2) Replace blocking smem loads with asynchronous copies and pipeline stages.
+//     Ampere:    cp.async (128-bit coalesced) + cp.async.commit_group /
+//                cp.async.wait_group — allows compute and memory to overlap.
+//     Hopper:    TMA (Tensor Memory Accelerator) — descriptor-based bulk copy;
+//                a single thread issues the transfer; pairs with warp
+//                specialization (dedicated producer warps do TMA, consumer
+//                warps do wgmma) and cuda::barrier arrive/wait.
+//     Blackwell: TMA for A/B tiles; tmem_load/store for the C accumulator.
+//
+//     Typically 2–4 pipeline stages in shared memory (ping-pong): while tile k
+//     is being computed, tile k+1 is already being fetched.  This hides nearly
+//     all DRAM latency and is the primary source of throughput in production.
+//
+// (3) Replace row-major w_tile with a swizzled shared memory layout.
+//     All architectures: cute::Swizzle<B,M,S> composed into the tile layout
+//     type, then ldmatrix (Ampere/Hopper) to load the MMA B-fragment.  The
+//     swizzle parameters are chosen so that the 32 threads of a warp each land
+//     on a different bank when executing ldmatrix — the right values depend on
+//     the datatype and MMA shape, and differ from a fix for our scalar-load
+//     access pattern.
+//
+// ZO-specific note:
+//     The Philox perturbation and dual accumulators (v_cache_p/n) have no
+//     CUTLASS analog; they are custom logic layered over the GEMM.  On all
+//     three architectures, z generation remains per-thread (stateless,
+//     counter-based), and the dual accumulator remains in registers.  Only
+//     the surrounding GEMM infrastructure changes.
 // ============================================================================
 #define ZO_TILE_M     4
 #define ZO_TILE_K     64
-#define ZO_TILE_N     256   // = ZO_TPR * 4
-#define FWD_THREADS   256   // = ZO_TILE_M * ZO_TPR
-#define ZO_TPR        64    // threads per row = FWD_THREADS / ZO_TILE_M = ZO_TILE_N / 4
+#define ZO_TILE_N     256
+#define PHILOX_WIDTH  4     // output width of philox_normal_4; fixed by the API
+
+#define THREAD_N      4     // outputs per thread per N-tile; must be multiple of
+                            // PHILOX_WIDTH.  PHILOX_WIDTH=4 is also the
+                            // bank-conflict-optimal choice: stride between adjacent
+                            // threads in w_tile grows with THREAD_N, giving
+                            // (THREAD_N/2)-way half conflicts; THREAD_N=4 minimizes.
 #define I_DIM         4096  // hidden (intermediate) dimension
-#define LAYERNORM_EPS 1e-5f
+#define LAYERNORM_EPS 1e-7f
+
+#define ZO_TPR        (ZO_TILE_N / THREAD_N)        // threads per row = 64
+#define FWD_THREADS   (ZO_TILE_M * ZO_TPR)          // = 256 (derived, not set directly)
+
+
+static_assert(THREAD_N % PHILOX_WIDTH == 0,
+              "THREAD_N must be a multiple of PHILOX_WIDTH (philox_normal_4 output width)");
 
 // ---------------------------------------------------------------------------
 // Hyperparameter constraints
 //
-// FWD_THREADS == ZO_TILE_M * ZO_TPR
+// ZO_TPR == ZO_TILE_N / THREAD_N   (derived, not set directly)
 //   Thread decomposition t = m_local * ZO_TPR + n_quarter.  ZO_TILE_M rows,
-//   ZO_TPR threads/row.
+//   ZO_TPR threads/row.  Each thread owns THREAD_N consecutive output columns
+//   per N-tile, covering the full ZO_TILE_N column tile.
 //
-// ZO_TILE_N == ZO_TPR * 4
-//   One Philox call per (thread, k-step) yields 4 N(0,1) samples, covering
-//   4 consecutive columns.  Each N-tile must contain exactly ZO_TPR groups
-//   of 4 columns — one group per thread — so ZO_TILE_N = 4 * ZO_TPR.
+// FWD_THREADS == ZO_TILE_M * ZO_TPR   (derived)
+//   Total threads per block.  ZO_TILE_M rows × ZO_TPR threads/row.
+//   Changing TILE_N or THREAD_N automatically adjusts FWD_THREADS.
 //
-// ZO_TPR == ZO_TILE_K   (follows from the two above + A-tile load)
-//   The A-tile [ZO_TILE_M × ZO_TILE_K] is loaded as inp_tile[t], one
-//   element per thread.  FWD_THREADS = ZO_TILE_M * ZO_TPR threads must
-//   cover ZO_TILE_M * ZO_TILE_K elements, so ZO_TPR must equal ZO_TILE_K.
+// ZO_TILE_K independent of ZO_TPR   (strided cooperative A-tile load)
+//   The A-tile [ZO_TILE_M × ZO_TILE_K] is loaded by the strided loop
+//     for (idx = t; idx < ZO_TILE_M*ZO_TILE_K; idx += FWD_THREADS)
+//   Any combination of tile sizes works; the loop handles partial coverage.
 //
 // ZO_TPR == 64   (warp-shuffle epilogue hardcodes 2 warps/row)
 //   Both stats and MSE reductions use smem2[m_local*2 + t_r/32] and
 //   warp_mse[m_local*2 + t_r/32].  This assumes exactly 2 warps per row.
-//   Changing ZO_TPR to 32 (1 warp) or 128 (4 warps) requires rewriting
+//   Changing ZO_TILE_N or THREAD_N such that ZO_TPR != 64 requires rewriting
 //   both epilogue reductions.
 //
+// THREAD_N % PHILOX_WIDTH == 0   (enforced by static_assert above)
+//   Each Philox call produces PHILOX_WIDTH=4 samples.  The inner g-loop runs
+//   THREAD_N/PHILOX_WIDTH times, consuming exactly THREAD_N samples total.
+//   Non-multiples would require a partial final call, wasting outputs and
+//   breaking counter alignment with zo_update_kernel.
+//   THREAD_N=PHILOX_WIDTH=4 is also bank-conflict-optimal (see w_tile note).
+//
 // I % ZO_TILE_N == 0   (checked in main)
-//   Same reason as the reference kernel: column-direction bounds guards are
-//   absent in the N-tile loop, so w_gate and v_cache go out of bounds if I
-//   is not a multiple of ZO_TILE_N.  Also ensures n_start is a multiple of
-//   4, keeping the Philox counter (n_start >> 2) lossless.
+//   Column-direction bounds guards are absent in the N-tile loop, so w_gate
+//   and v_cache go out of bounds if I is not a multiple of ZO_TILE_N.  Also
+//   ensures n_start / PHILOX_WIDTH is exact, keeping the Philox counter lossless.
 //
 // ZO_TILE_K % 4 == 0   (Philox ILP)
 //   #pragma unroll 4 replicates the ki loop body 4 times, issuing 4
 //   independent Philox chains (distinct counters k*IQ+...).  If ZO_TILE_K
 //   is not divisible by 4, the compiler emits a remainder iteration whose
-//   counter is not independent of the preceding group, collapsing the 4
-//   chains into a dependency and eliminating the ILP benefit.
+//   counter is not independent of the preceding group.
 //
-// I_DIM / ZO_TILE_N == I at runtime   (v_cache compile-time size)
-//   float v_cache[(I_DIM/ZO_TILE_N)*4] is compile-time sized: I_DIM/ZO_TILE_N
-//   N-tiles, 4 columns per thread per tile.  I_DIM must match the I passed
-//   to the kernel; if they differ the cache is undersized or wastes registers.
+// I_DIM == I at runtime   (v_cache compile-time size)
+//   float v_cache_p/n[(I_DIM/ZO_TILE_N)*THREAD_N] is compile-time sized.
+//   I_DIM must match the I passed to the kernel.
 //
 // d % ZO_TILE_K: not required   (the check in main is overly conservative)
 //   A-tile and B-tile loads are guarded by (k < d), so partial K-tiles are
 //   correctly zero-padded.  The update kernel uses a flat linear group index
-//   (group = k*(I/4) + n/4) independent of ZO_TILE_K, so partial tiles
-//   cause no aliasing in the Philox counter space.
+//   independent of ZO_TILE_K, so partial tiles cause no Philox aliasing.
 //
 // Philox counter uniqueness
-//   counter = k*(I/4) + n_start/4 + n_quarter.  The per-row group offset
-//   n_start/4 + n_quarter is always < I/4, so no two weight rows share a
-//   counter value.  This is guaranteed once I % ZO_TILE_N == 0.
+//   counter = k*(I/PHILOX_WIDTH) + n_start/PHILOX_WIDTH
+//             + n_quarter*(THREAD_N/PHILOX_WIDTH) + g
+//   uniquely addresses each group of PHILOX_WIDTH weights.  The per-k offset
+//   n_start/PHILOX_WIDTH + n_quarter*(THREAD_N/PHILOX_WIDTH) + g is always
+//   < I/PHILOX_WIDTH, so no two weight rows share a counter.  Guaranteed once
+//   I % ZO_TILE_N == 0.  zo_update_kernel uses the same counter formula with
+//   group = k*(I/PHILOX_WIDTH) + n/PHILOX_WIDTH (linear group index).
 //
 // Hardware limits
 //   FWD_THREADS <= 1024 (max threads/block).
-//   shm_fwd <= 49152 by default (48 KB); up to 98304 on sm_75+ with
-//   cudaFuncSetAttribute(f, cudaFuncAttributeMaxDynamicSharedMemorySize, N).
+//   shm_fwd ≈ 34 KB < 48 KB default; no cudaFuncSetAttribute needed.
 // ---------------------------------------------------------------------------
 
 __global__ void zo_fused_forward_kernel(
-    half       *out_pos,   // [B*M, I] output for W + eps*z
-    half       *out_neg,   // [B*M, I] output for W - eps*z
-    float      *loss_pos,  // MSE accumulator for + perturbation
-    float      *loss_neg,  // MSE accumulator for - perturbation
-    const half *inp_pos,   // [B, M, d] — input for + perturbation (ZO: same as inp_neg)
-    const half *inp_neg,   // [B, M, d] — input for - perturbation (ZO: same as inp_pos)
-    const half *w_gate,    // [d, I]
-    const half *target,    // [B*M, I]
-    const half *w_norm,    // [I]
-    const half *b_norm,    // [I]
+    half       * __restrict__ out_pos,   // [B*M, I] output for W + eps*z
+    half       * __restrict__ out_neg,   // [B*M, I] output for W - eps*z
+    float      * __restrict__ loss_pos,  // MSE accumulator for + perturbation
+    float      * __restrict__ loss_neg,  // MSE accumulator for - perturbation
+    const half * __restrict__ inp_pos,   // [B, M, d] — input for + perturbation (ZO: same as inp_neg)
+    const half * __restrict__ inp_neg,   // [B, M, d] — input for - perturbation (ZO: same as inp_pos)
+    const half * __restrict__ w_gate,    // [d, I]
+    const half * __restrict__ target,    // [B*M, I]
+    const half * __restrict__ w_norm,    // [I]
+    const half * __restrict__ b_norm,    // [I]
     int M, int d, int I,
     unsigned long long seed, float eps)
 {
@@ -238,106 +314,105 @@ __global__ void zo_fused_forward_kernel(
     const int tile_row = blockIdx.x;
     const int batch    = blockIdx.y;
     const int t        = threadIdx.x;
-    const int IQ       = I >> 2;
+    const int IQ       = I / PHILOX_WIDTH;  // groups of PHILOX_WIDTH per weight row
 
     // Thread decomposition: t = m_local * ZO_TPR + n_quarter
-    const int m_local  = t / ZO_TPR;
+    const int m_local   = t / ZO_TPR;
     const int n_quarter = t % ZO_TPR;
-    const int row      = tile_row * ZO_TILE_M + m_local;
+    const int row       = tile_row * ZO_TILE_M + m_local;
 
     const half *inp_pos_base = inp_pos + (size_t)batch * M * d;
     const half *inp_neg_base = inp_neg + (size_t)batch * M * d;
 
     // ----------------------------------------------------------------
-    // Step 1: tiled GEMM — outer N-tile, inner K-tile.
-    // All 256 threads cooperate loading inp_tile and w_tile from DRAM into
-    // shared memory; each thread then computes dot products only for its own
-    // m_local row (4 columns at a time matching Philox's output width).
-    // After all K-strips, a[0..3] holds the complete dot products; SiLU is
-    // applied and results go into v_cache registers.
+    // Step 1: tiled GEMM — K-outer, N-inner.
+    //
+    // v_cache_p/n[64] accumulate the full dot products for both
+    // perturbations across all K-tiles before SiLU is applied.
+    //
+    // K-outer means inp_tile is loaded once per K-tile and reused for all
+    // N-tiles in the inner loop, rather than being reloaded once per
+    // (K-tile, N-tile) pair.
     // ----------------------------------------------------------------
-    float v_cache_p[(I_DIM / ZO_TILE_N) * 4];  // post-SiLU values for + perturbation
-    float v_cache_n[(I_DIM / ZO_TILE_N) * 4];  // post-SiLU values for - perturbation
-    float2 local_p = {0.f, 0.f};               // (Σv, Σv²) for + perturbation
-    float2 local_n = {0.f, 0.f};               // (Σv, Σv²) for - perturbation
-    int ci = 0;
+    float v_cache_p[(I_DIM / ZO_TILE_N) * THREAD_N] = {};
+    float v_cache_n[(I_DIM / ZO_TILE_N) * THREAD_N] = {};
 
-    for (int n_start = 0; n_start < I; n_start += ZO_TILE_N, ci += 4) {
-        float a_p[4] = {};   // dot product accumulators for + perturbation
-        float a_n[4] = {};   // dot product accumulators for - perturbation
+    for (int k_start = 0; k_start < d; k_start += ZO_TILE_K) {
+        // Load both A tiles — once per K-tile, shared across all N-tiles.
+        // In ZO, inp_pos and inp_neg are the same array; the L1 cache
+        // handles the duplicate load transparently.
+        for (int idx = t; idx < ZO_TILE_M * ZO_TILE_K; idx += FWD_THREADS) {
+            int mi = idx / ZO_TILE_K, ki = idx % ZO_TILE_K;
+            int r  = tile_row * ZO_TILE_M + mi;
+            int k  = k_start + ki;
+            bool valid = (r < M && k < d);
+            inp_tile_p[idx] = valid ? __half2float(__ldg(&inp_pos_base[r * d + k])) : 0.f;
+            inp_tile_n[idx] = valid ? __half2float(__ldg(&inp_neg_base[r * d + k])) : 0.f;
+        }
+        __syncthreads();
 
-        for (int k_start = 0; k_start < d; k_start += ZO_TILE_K) {
-            // Load both A tiles (one element per thread each).
-            // In ZO, inp_pos and inp_neg point to the same array; the L1 cache
-            // handles the duplicate load transparently.
-            {
-                int mi = t / ZO_TILE_K, ki = t % ZO_TILE_K;
-                int r  = tile_row * ZO_TILE_M + mi;
-                int k  = k_start + ki;
-                bool valid = (r < M && k < d);
-                inp_tile_p[t] = valid ? __half2float(inp_pos_base[r * d + k]) : 0.f;
-                inp_tile_n[t] = valid ? __half2float(inp_neg_base[r * d + k]) : 0.f;
-            }
-
-            // Load B tile: [ZO_TILE_K × ZO_TILE_N] halfs, coalesced
+        for (int n_start = 0, ci = 0; n_start < I; n_start += ZO_TILE_N, ci += THREAD_N) {
+            // Load B tile: [ZO_TILE_K × ZO_TILE_N] halfs, coalesced.
             for (int idx = t; idx < ZO_TILE_K * ZO_TILE_N; idx += FWD_THREADS) {
                 int ki = idx / ZO_TILE_N, ni = idx % ZO_TILE_N;
                 int k  = k_start + ki;
-                w_tile[idx] = (k < d) ? w_gate[(size_t)k * I + n_start + ni]
+                w_tile[idx] = (k < d) ? __ldg(&w_gate[(size_t)k * I + n_start + ni])
                                       : __float2half(0.f);
             }
             __syncthreads();
 
-            // Dot product loop.  #pragma unroll 4 makes the compiler emit 4
-            // copies with ki=0,1,2,3 simultaneously — each has a different
-            // counter (k varies), so the 4 Philox calls are independent and
-            // the GPU can pipeline their ~10-cycle latency chains in parallel.
+            // Dot product loop
             #pragma unroll 4
             for (int ki = 0; ki < ZO_TILE_K; ++ki) {
                 int k = k_start + ki;
-                // counter = k*(I/4) + column_group; same formula as zo_update_kernel,
-                // so z is reproduced identically without storing it.
-                float4 z4 = philox_normal_4(seed,
-                    (unsigned long long)k * IQ + (n_start >> 2) + n_quarter);
-                const half *wt = w_tile + ki * ZO_TILE_N + (n_quarter << 2);
-                float w0 = __half2float(wt[0]), p0 = eps * z4.x;
-                float w1 = __half2float(wt[1]), p1 = eps * z4.y;
-                float w2 = __half2float(wt[2]), p2 = eps * z4.z;
-                float w3 = __half2float(wt[3]), p3 = eps * z4.w;
                 float iv_p = inp_tile_p[m_local * ZO_TILE_K + ki];
                 float iv_n = inp_tile_n[m_local * ZO_TILE_K + ki];
-                a_p[0] += iv_p * (w0 + p0);  a_n[0] += iv_n * (w0 - p0);
-                a_p[1] += iv_p * (w1 + p1);  a_n[1] += iv_n * (w1 - p1);
-                a_p[2] += iv_p * (w2 + p2);  a_n[2] += iv_n * (w2 - p2);
-                a_p[3] += iv_p * (w3 + p3);  a_n[3] += iv_n * (w3 - p3);
+                const half *wt = w_tile + ki * ZO_TILE_N + n_quarter * THREAD_N;
+                // Base counter for this thread's first PHILOX_WIDTH-group in this ki step.
+                unsigned long long base_ctr = (unsigned long long)k * IQ
+                                            + n_start / PHILOX_WIDTH
+                                            + n_quarter * (THREAD_N / PHILOX_WIDTH);
+                #pragma unroll
+                for (int g = 0; g < THREAD_N / PHILOX_WIDTH; ++g) {
+                    float4 z4 = philox_normal_4(seed, base_ctr + g);
+                    float w0 = __half2float(wt[g * PHILOX_WIDTH + 0]), p0 = eps * z4.x;
+                    float w1 = __half2float(wt[g * PHILOX_WIDTH + 1]), p1 = eps * z4.y;
+                    float w2 = __half2float(wt[g * PHILOX_WIDTH + 2]), p2 = eps * z4.z;
+                    float w3 = __half2float(wt[g * PHILOX_WIDTH + 3]), p3 = eps * z4.w;
+                    v_cache_p[ci + g * PHILOX_WIDTH + 0] += iv_p * (w0 + p0);
+                    v_cache_n[ci + g * PHILOX_WIDTH + 0] += iv_n * (w0 - p0);
+                    v_cache_p[ci + g * PHILOX_WIDTH + 1] += iv_p * (w1 + p1);
+                    v_cache_n[ci + g * PHILOX_WIDTH + 1] += iv_n * (w1 - p1);
+                    v_cache_p[ci + g * PHILOX_WIDTH + 2] += iv_p * (w2 + p2);
+                    v_cache_n[ci + g * PHILOX_WIDTH + 2] += iv_n * (w2 - p2);
+                    v_cache_p[ci + g * PHILOX_WIDTH + 3] += iv_p * (w3 + p3);
+                    v_cache_n[ci + g * PHILOX_WIDTH + 3] += iv_n * (w3 - p3);
+                }
             }
             __syncthreads();
         }
-
-        // SiLU both perturbations; cache in registers; collect stats for both.
-        float vp0 = a_p[0] / (1.f + expf(-a_p[0]));
-        float vp1 = a_p[1] / (1.f + expf(-a_p[1]));
-        float vp2 = a_p[2] / (1.f + expf(-a_p[2]));
-        float vp3 = a_p[3] / (1.f + expf(-a_p[3]));
-        float vn0 = a_n[0] / (1.f + expf(-a_n[0]));
-        float vn1 = a_n[1] / (1.f + expf(-a_n[1]));
-        float vn2 = a_n[2] / (1.f + expf(-a_n[2]));
-        float vn3 = a_n[3] / (1.f + expf(-a_n[3]));
-        v_cache_p[ci    ] = vp0; v_cache_p[ci + 1] = vp1;
-        v_cache_p[ci + 2] = vp2; v_cache_p[ci + 3] = vp3;
-        v_cache_n[ci    ] = vn0; v_cache_n[ci + 1] = vn1;
-        v_cache_n[ci + 2] = vn2; v_cache_n[ci + 3] = vn3;
-        local_p.x += vp0 + vp1 + vp2 + vp3;
-        local_p.y += vp0*vp0 + vp1*vp1 + vp2*vp2 + vp3*vp3;
-        local_n.x += vn0 + vn1 + vn2 + vn3;
-        local_n.y += vn0*vn0 + vn1*vn1 + vn2*vn2 + vn3*vn3;
     }
 
     // ----------------------------------------------------------------
-    // Step 2: LayerNorm stats — warp shuffle reduction for mean and variance.
-    // Each thread has accumulated (Σv, Σv²) across its columns in 'local'.
+    // Step 2: SiLU in-place on v_cache_p/n; collect per-row stats
+    // (Σv, Σv²) for both perturbations; warp-shuffle reduction.
     // ----------------------------------------------------------------
     const int t_r = n_quarter;
+
+    float2 local_p = {0.f, 0.f};
+    float2 local_n = {0.f, 0.f};
+    for (int ci = 0; ci < (I_DIM / ZO_TILE_N) * THREAD_N; ++ci) {
+        float g = v_cache_p[ci];
+        float v = g / (1.f + expf(-g));
+        v_cache_p[ci] = v;
+        local_p.x += v;
+        local_p.y += v * v;
+        g = v_cache_n[ci];
+        v = g / (1.f + expf(-g));
+        v_cache_n[ci] = v;
+        local_n.x += v;
+        local_n.y += v * v;
+    }
 
     // Warp reduction for both perturbations simultaneously — one butterfly pass
     // each, no extra cost over reducing a single value.
@@ -363,7 +438,7 @@ __global__ void zo_fused_forward_kernel(
     float inv_std_n = rsqrtf(agg_n.y / I - mean_n * mean_n + LAYERNORM_EPS);
 
     // ----------------------------------------------------------------
-    // Step 3: normalize both outputs from register caches; write both;
+    // Step 3: normalize both outputs from v_cache; write both;
     // accumulate MSE for each vs the shared target.
     // ----------------------------------------------------------------
     float local_loss_p = 0.f, local_loss_n = 0.f;
@@ -371,13 +446,12 @@ __global__ void zo_fused_forward_kernel(
         half       *out_row_p = out_pos + (size_t)(batch * M + row) * I;
         half       *out_row_n = out_neg + (size_t)(batch * M + row) * I;
         const half *tgt_row   = target  + (size_t)(batch * M + row) * I;
-        ci = 0;
-        for (int n_start = 0; n_start < I; n_start += ZO_TILE_N, ci += 4) {
-            int n0 = n_start + (n_quarter << 2);
-            for (int j = 0; j < 4; ++j) {
-                float gamma_j = __half2float(w_norm[n0 + j]);
-                float beta_j  = __half2float(b_norm[n0 + j]);
-                float tgt_j   = __half2float(tgt_row[n0 + j]);
+        for (int n_start = 0, ci = 0; n_start < I; n_start += ZO_TILE_N, ci += THREAD_N) {
+            int n0 = n_start + n_quarter * THREAD_N;
+            for (int j = 0; j < THREAD_N; ++j) {
+                float gamma_j = __half2float(__ldg(&w_norm[n0 + j]));
+                float beta_j  = __half2float(__ldg(&b_norm[n0 + j]));
+                float tgt_j   = __half2float(__ldg(&tgt_row[n0 + j]));
                 float vp = (v_cache_p[ci + j] - mean_p) * inv_std_p * gamma_j + beta_j;
                 float vn = (v_cache_n[ci + j] - mean_n) * inv_std_n * gamma_j + beta_j;
                 out_row_p[n0 + j] = __float2half(vp);
@@ -414,30 +488,31 @@ __global__ void zo_fused_forward_kernel(
 // Applies:  W_gate[k, n] -= lr * grad_est * z[k, n]
 //
 // z is regenerated from the same (seed, counter) as zo_fused_forward:
-//   counter = k*(I/4) + n/4 = group  (linear index of the 4-weight group)
+//   counter = k*(I/PHILOX_WIDTH) + n/PHILOX_WIDTH = group
+//   (linear index of the PHILOX_WIDTH-weight group)
 //
-// Since weights are stored row-major and I % 4 == 0, aligned groups of 4
-// consecutive weights always fall within the same weight row k — so the
-// counter formula is equivalent to the forward kernel's counter.
-// All 4 Philox outputs are consumed per thread, same as the forward kernel.
+// Since weights are stored row-major and I % PHILOX_WIDTH == 0, aligned groups
+// of PHILOX_WIDTH consecutive weights always fall within the same weight row k
+// — so the counter is equivalent to the forward kernel's base_ctr+g.
+// All PHILOX_WIDTH Philox outputs are consumed per thread.
 //
-// Requires d*I % 4 == 0 (satisfied when I % 4 == 0).
+// Requires d*I % PHILOX_WIDTH == 0 (satisfied when I % PHILOX_WIDTH == 0).
 // ============================================================================
 #define UPD_THREADS 256
 
 __global__ void zo_update_kernel(
-    half *w_gate,      // [d, I], updated in-place
+    half * __restrict__ w_gate,  // [d, I], updated in-place
     int d, int I,
     unsigned long long seed, float lr, float grad_est)
 {
-    // group = k*(I/4) + t  where  t = n/4,  same counter as zo_fused_forward
+    // group = k*(I/PHILOX_WIDTH) + n/PHILOX_WIDTH — same counter as zo_fused_forward
     int group = blockIdx.x * UPD_THREADS + threadIdx.x;
-    if ((size_t)group * 4 >= (size_t)d * I) return;
+    if ((size_t)group * PHILOX_WIDTH >= (size_t)d * I) return;
 
     float4 z4    = philox_normal_4(seed, (unsigned long long)group);
     float  scale = lr * grad_est;
 
-    half *w = w_gate + (size_t)group * 4;
+    half *w = w_gate + (size_t)group * PHILOX_WIDTH;
     w[0] = __float2half(__half2float(w[0]) - scale * z4.x);
     w[1] = __float2half(__half2float(w[1]) - scale * z4.y);
     w[2] = __float2half(__half2float(w[2]) - scale * z4.z);
@@ -503,10 +578,12 @@ int main() {
     const int n_norm = I;
     const int n_out  = B * M * I;
 
+    printf("\n");
     printf("=== zo_fused_forward + zo_update ===\n");
     printf("  B=%d  M=%d  d=%d  I=%d\n", B, M, d, I);
-    printf("  ZO_TILE_M=%d  ZO_TILE_K=%d  ZO_TILE_N=%d  FWD_THREADS=%d  UPD_THREADS=%d\n",
-           ZO_TILE_M, ZO_TILE_K, ZO_TILE_N, FWD_THREADS, UPD_THREADS);
+    printf("  ZO_TILE_M=%d  ZO_TILE_K=%d  ZO_TILE_N=%d  THREAD_N=%d  PHILOX_WIDTH=%d"
+           "  FWD_THREADS=%d  UPD_THREADS=%d\n",
+           ZO_TILE_M, ZO_TILE_K, ZO_TILE_N, THREAD_N, PHILOX_WIDTH, FWD_THREADS, UPD_THREADS);
 
     // Host arrays
     half  *h_inp     = (half *)malloc(n_inp  * sizeof(half));
@@ -548,7 +625,7 @@ int main() {
     checkCuda(cudaMemcpy(d_target, h_target, n_out  * sizeof(half), cudaMemcpyHostToDevice));
 
     const int shm_fwd = 2 * ZO_TILE_M * ZO_TILE_K * sizeof(float)   // inp_tile_p + inp_tile_n
-                      + ZO_TILE_K * ZO_TILE_N * sizeof(half)          // w_tile (shared)
+                      + ZO_TILE_K * ZO_TILE_N * sizeof(half)          // w_tile (half)
                       + 2 * ZO_TILE_M * 2 * sizeof(float2)            // smem2_p + smem2_n
                       + 2 * ZO_TILE_M * 2 * sizeof(float);            // warp_mse_p + warp_mse_n
     dim3 grid((M + ZO_TILE_M - 1) / ZO_TILE_M, B);
@@ -581,7 +658,7 @@ int main() {
 
     printf("  First 4 outputs — %4s  %16s  %16s\n", "idx", "CPU (fp32)", "GPU (fp16→fp32)");
     for (int i = 0; i < 4; ++i)
-        printf("               — %-4d  %+15.8f  %+15.8f\n",
+        printf("    %-4d  %+15.8f  %+15.8f\n",
                i, h_out_ref[i], h_out_f32[i]);
 
     // -----------------------------------------------------------------------
@@ -624,9 +701,8 @@ int main() {
     printf("  loss (unperturbed, before):          %.6f\n", h_loss_before / n_elems);
     printf("  [Φ(θ+εz,b) - Φ(θ-εz,b)] / 2ε:  %.6f\n", grad_est);
 
-
     // Apply:  W_gate -= lr * grad_est * z  (z regenerated from seed)
-    int upd_groups = (d * I) / 4;  // exact since I % 4 == 0
+    int upd_groups = (d * I) / PHILOX_WIDTH;  // exact since I % PHILOX_WIDTH == 0
     int upd_blocks = (upd_groups + UPD_THREADS - 1) / UPD_THREADS;
     zo_update_kernel<<<upd_blocks, UPD_THREADS>>>(
         d_w_gate, d, I, seed, lr, grad_est);
