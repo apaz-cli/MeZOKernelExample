@@ -69,7 +69,7 @@ inline void gpuAssert(cudaError_t code, const char *file, int line) {
 // philox_uniform_4 — (seed, counter) → 4 uniform floats in [0, 1)
 // philox_normal_4  — Box-Muller pairs: (u0,u1)→(g0,g1), (u2,u3)→(g2,g3)
 // ============================================================================
-__device__ __forceinline__
+__host__ __device__ __forceinline__
 float4 philox_uniform_4(unsigned long long seed, unsigned long long counter)
 {
     const unsigned int P10A = 0x9E3779B9u, P10B = 0xBB67AE85u;
@@ -80,8 +80,9 @@ float4 philox_uniform_4(unsigned long long seed, unsigned long long counter)
                            (unsigned int)(counter >> 32), 0u, 0u);
     #pragma unroll
     for (int r = 0; r < 7; ++r) {
-        unsigned int h0 = __umulhi(PSA, ctr.x);
-        unsigned int h1 = __umulhi(PSB, ctr.z);
+        // Portable mul.hi: (a*b)>>32 — nvcc lowers this to mul.hi.u32 on device.
+        unsigned int h0 = (unsigned int)(((unsigned long long)PSA * ctr.x) >> 32);
+        unsigned int h1 = (unsigned int)(((unsigned long long)PSB * ctr.z) >> 32);
         ctr = make_uint4(h1 ^ ctr.y ^ key.x,  PSA * ctr.x,
                          h0 ^ ctr.w ^ key.y,  PSB * ctr.z);
         key.x += P10A; key.y += P10B;
@@ -90,7 +91,7 @@ float4 philox_uniform_4(unsigned long long seed, unsigned long long counter)
     return make_float4(ctr.x * s, ctr.y * s, ctr.z * s, ctr.w * s);
 }
 
-__device__ __forceinline__
+__host__ __device__ __forceinline__
 float4 philox_normal_4(unsigned long long seed, unsigned long long counter)
 {
     float4 u = philox_uniform_4(seed, counter);
@@ -98,8 +99,9 @@ float4 philox_normal_4(unsigned long long seed, unsigned long long counter)
     u.z = fmaxf(u.z, 1e-7f);
     float r0 = sqrtf(-2.f * logf(u.x)), t0 = 6.28318530f * u.y;
     float r1 = sqrtf(-2.f * logf(u.z)), t1 = 6.28318530f * u.w;
-    return make_float4(r0 * __cosf(t0), r0 * __sinf(t0),
-                       r1 * __cosf(t1), r1 * __sinf(t1));
+    // cosf/sinf: full-precision on host; maps to hardware trig on device.
+    return make_float4(r0 * cosf(t0), r0 * sinf(t0),
+                       r1 * cosf(t1), r1 * sinf(t1));
 }
 
 // ============================================================================
@@ -520,44 +522,99 @@ __global__ void zo_update_kernel(
 }
 
 // ============================================================================
-// CPU reference — unperturbed forward pass for correctness verification
+// CPU reference — dual-perturbed forward pass, matching zo_fused_forward_kernel.
+//
+// Computes, for each (batch, row):
+//   out_pos = layernorm(silu(inp_pos @ (W_gate + eps*z)))
+//   out_neg = layernorm(silu(inp_neg @ (W_gate - eps*z)))
+// and accumulates MSE vs target into *loss_pos / *loss_neg.
+//
+// z is regenerated from the same (seed, counter) formula as the GPU kernels:
+//   counter = k * (I/PHILOX_WIDTH) + n/PHILOX_WIDTH
+// so philox_normal_4(seed, counter)[j] gives z[k, n+j].
 // ============================================================================
 void cpu_reference(
-    float      *out,
-    const half *inp,
-    const half *w_gate,
-    const half *w_norm,
-    const half *b_norm,
-    int B, int M, int d, int I)
+    float      *out_pos,    // [B*M, I]
+    float      *out_neg,    // [B*M, I]
+    float      *loss_pos,   // scalar, written (not accumulated into)
+    float      *loss_neg,   // scalar, written (not accumulated into)
+    const half *inp_pos,    // [B, M, d]
+    const half *inp_neg,    // [B, M, d]
+    const half *w_gate,     // [d, I]
+    const half *target,     // [B*M, I]
+    const half *w_norm,     // [I]
+    const half *b_norm,     // [I]
+    int B, int M, int d, int I,
+    unsigned long long seed, float eps)
 {
-    float *tmp = (float *)malloc(I * sizeof(float));
+    const int IQ = I / PHILOX_WIDTH;  // groups of PHILOX_WIDTH per weight row
+    *loss_pos = 0.f;
+    *loss_neg = 0.f;
+    float *tmp_p = (float *)malloc(I * sizeof(float));
+    float *tmp_n = (float *)malloc(I * sizeof(float));
     for (int b = 0; b < B; ++b) {
-        const half *inp_b = inp + (size_t)b * M * d;
-        float      *out_b = out + (size_t)b * M * I;
+        const half *inp_pos_b = inp_pos + (size_t)b * M * d;
+        const half *inp_neg_b = inp_neg + (size_t)b * M * d;
+        float      *out_pos_b = out_pos + (size_t)b * M * I;
+        float      *out_neg_b = out_neg + (size_t)b * M * I;
+        const half *tgt_b     = target  + (size_t)b * M * I;
         for (int m = 0; m < M; ++m) {
-            for (int i = 0; i < I; ++i) {
-                float dot = 0.f;
-                for (int k = 0; k < d; ++k)
-                    dot += __half2float(inp_b[m*d + k]) *
-                           __half2float(w_gate[k*I + i]);
-                tmp[i] = dot / (1.f + expf(-dot));
+            // GEMM with perturbation — k-outer, n-inner (matches GPU loop order).
+            for (int i = 0; i < I; ++i) tmp_p[i] = tmp_n[i] = 0.f;
+            for (int k = 0; k < d; ++k) {
+                float iv_p = __half2float(inp_pos_b[m*d + k]);
+                float iv_n = __half2float(inp_neg_b[m*d + k]);
+                for (int n = 0; n < I; n += PHILOX_WIDTH) {
+                    unsigned long long ctr = (unsigned long long)k * IQ
+                                          + (unsigned long long)(n / PHILOX_WIDTH);
+                    float4 z4 = philox_normal_4(seed, ctr);
+                    float zv[PHILOX_WIDTH] = {z4.x, z4.y, z4.z, z4.w};
+                    for (int j = 0; j < PHILOX_WIDTH; ++j) {
+                        float w = __half2float(w_gate[(size_t)k * I + n + j]);
+                        float p = eps * zv[j];
+                        tmp_p[n + j] += iv_p * (w + p);
+                        tmp_n[n + j] += iv_n * (w - p);
+                    }
+                }
             }
-            float sum = 0.f, sumsq = 0.f;
-            for (int i = 0; i < I; ++i) { sum += tmp[i]; sumsq += tmp[i]*tmp[i]; }
-            float mean    = sum / I;
-            float inv_std = 1.f / sqrtf(sumsq / I - mean*mean + LAYERNORM_EPS);
-            for (int i = 0; i < I; ++i)
-                out_b[m*I + i] = (tmp[i]-mean)*inv_std *
-                                  __half2float(w_norm[i]) +
-                                  __half2float(b_norm[i]);
+            // SiLU in-place
+            for (int i = 0; i < I; ++i) {
+                float g = tmp_p[i]; tmp_p[i] = g / (1.f + expf(-g));
+                      g = tmp_n[i]; tmp_n[i] = g / (1.f + expf(-g));
+            }
+            // LayerNorm stats
+            float sum_p = 0.f, sumsq_p = 0.f;
+            float sum_n = 0.f, sumsq_n = 0.f;
+            for (int i = 0; i < I; ++i) {
+                sum_p += tmp_p[i]; sumsq_p += tmp_p[i] * tmp_p[i];
+                sum_n += tmp_n[i]; sumsq_n += tmp_n[i] * tmp_n[i];
+            }
+            float mean_p    = sum_p / I;
+            float inv_std_p = 1.f / sqrtf(sumsq_p / I - mean_p * mean_p + LAYERNORM_EPS);
+            float mean_n    = sum_n / I;
+            float inv_std_n = 1.f / sqrtf(sumsq_n / I - mean_n * mean_n + LAYERNORM_EPS);
+            // Write outputs and accumulate MSE
+            float      *out_row_p = out_pos_b + (size_t)m * I;
+            float      *out_row_n = out_neg_b + (size_t)m * I;
+            const half *tgt_row   = tgt_b     + (size_t)m * I;
+            for (int i = 0; i < I; ++i) {
+                float gamma = __half2float(w_norm[i]);
+                float beta  = __half2float(b_norm[i]);
+                float tgt   = __half2float(tgt_row[i]);
+                float vp = (tmp_p[i] - mean_p) * inv_std_p * gamma + beta;
+                float vn = (tmp_n[i] - mean_n) * inv_std_n * gamma + beta;
+                out_row_p[i] = vp;
+                out_row_n[i] = vn;
+                float ep = vp - tgt, en = vn - tgt;
+                *loss_pos += ep * ep;
+                *loss_neg += en * en;
+            }
         }
     }
-    free(tmp);
+    free(tmp_p);
+    free(tmp_n);
 }
 
-// ============================================================================
-// main
-// ============================================================================
 static float randf_11() { return (float)rand() / (float)RAND_MAX * 2.f - 1.f; }
 
 int main() {
@@ -586,14 +643,15 @@ int main() {
            ZO_TILE_M, ZO_TILE_K, ZO_TILE_N, THREAD_N, PHILOX_WIDTH, FWD_THREADS, UPD_THREADS);
 
     // Host arrays
-    half  *h_inp     = (half *)malloc(n_inp  * sizeof(half));
-    half  *h_w_gate  = (half *)malloc(n_w    * sizeof(half));
-    half  *h_w_norm  = (half *)malloc(n_norm * sizeof(half));
-    half  *h_b_norm  = (half *)malloc(n_norm * sizeof(half));
-    half  *h_target  = (half *)malloc(n_out  * sizeof(half));
-    half  *h_out_gpu = (half *)malloc(n_out  * sizeof(half));
-    float *h_out_ref = (float*)malloc(n_out  * sizeof(float));
-    float *h_out_f32 = (float*)malloc(n_out  * sizeof(float));
+    half  *h_inp         = (half *)malloc(n_inp  * sizeof(half));
+    half  *h_w_gate      = (half *)malloc(n_w    * sizeof(half));
+    half  *h_w_norm      = (half *)malloc(n_norm * sizeof(half));
+    half  *h_b_norm      = (half *)malloc(n_norm * sizeof(half));
+    half  *h_target      = (half *)malloc(n_out  * sizeof(half));
+    half  *h_out_gpu     = (half *)malloc(n_out  * sizeof(half));
+    float *h_out_ref_pos = (float*)malloc(n_out  * sizeof(float));
+    float *h_out_ref_neg = (float*)malloc(n_out  * sizeof(float));
+    float *h_out_f32     = (float*)malloc(n_out  * sizeof(float));
 
     srand(42);
     for (int i = 0; i < n_inp;  ++i) h_inp[i]    = __float2half(randf_11());
@@ -645,12 +703,15 @@ int main() {
 
     checkCuda(cudaMemcpy(h_out_gpu, d_out_pos, n_out * sizeof(half), cudaMemcpyDeviceToHost));
     for (int i = 0; i < n_out; ++i) h_out_f32[i] = __half2float(h_out_gpu[i]);
-    cpu_reference(h_out_ref, h_inp, h_w_gate, h_w_norm, h_b_norm, B, M, d, I);
+    float ref_loss_pos, ref_loss_neg;
+    cpu_reference(h_out_ref_pos, h_out_ref_neg, &ref_loss_pos, &ref_loss_neg,
+                  h_inp, h_inp, h_w_gate, h_target, h_w_norm, h_b_norm,
+                  B, M, d, I, /*seed=*/0ULL, /*eps=*/0.f);
 
     float abs_err = 0.f, max_ref = 0.f;
     for (int i = 0; i < n_out; ++i) {
-        abs_err = fmaxf(abs_err, fabsf(h_out_ref[i] - h_out_f32[i]));
-        max_ref = fmaxf(max_ref, fabsf(h_out_ref[i]));
+        abs_err = fmaxf(abs_err, fabsf(h_out_ref_pos[i] - h_out_f32[i]));
+        max_ref = fmaxf(max_ref, fabsf(h_out_ref_pos[i]));
     }
     float rel_err = abs_err / (max_ref + 1e-8f);
     printf("  Max abs error: %.4e  Max rel error: %.4e  %s\n",
@@ -659,7 +720,7 @@ int main() {
     printf("  First 4 outputs — %4s  %16s  %16s\n", "idx", "CPU (fp32)", "GPU (fp16→fp32)");
     for (int i = 0; i < 4; ++i)
         printf("    %-4d  %+15.8f  %+15.8f\n",
-               i, h_out_ref[i], h_out_f32[i]);
+               i, h_out_ref_pos[i], h_out_f32[i]);
 
     // -----------------------------------------------------------------------
     // Test 2: ZO gradient estimate and weight update
@@ -761,7 +822,8 @@ int main() {
 
     // Cleanup
     free(h_inp); free(h_w_gate); free(h_w_norm); free(h_b_norm);
-    free(h_target); free(h_out_gpu); free(h_out_ref); free(h_out_f32);
+    free(h_target); free(h_out_gpu);
+    free(h_out_ref_pos); free(h_out_ref_neg); free(h_out_f32);
     cudaFree(d_inp); cudaFree(d_w_gate); cudaFree(d_w_norm); cudaFree(d_b_norm);
     cudaFree(d_target); cudaFree(d_out_pos); cudaFree(d_out_neg);
     cudaFree(d_loss_pos); cudaFree(d_loss_neg);
