@@ -3,15 +3,15 @@
  *
  *
  * MeZO-style zeroth-order (ZO) optimization on:
- *   out = layernorm(silu(inp @ W_gate))
+ *   out = layernorm(silu(inp @ W))
  * where
  *   inp    [B, M, d] — batch of M-row inputs
- *   W_gate [d, I]    — shared weight, updated in-place
+ *   W [d, I]    — shared weight, updated in-place
  *   out    [B, M, I] — batch outputs
  *
- * All batch samples share the same perturbation z ~ N(0,1) for W_gate.
+ * All batch samples share the same perturbation z ~ N(0,1) for W.
  * z is never materialized; each element is regenerated on-the-fly from a
- * seed via Philox counter-based PRNG (O(1) skip-ahead, no sequential state).
+ * seed via Philox counter-based PRNG.
  *
  * Two kernels:
  *   zo_fused_forward — perturbed forward pass + MSE loss accumulation
@@ -22,16 +22,13 @@
  *   columns n0 = n_start + THREAD_N*n_quarter for its own row m_local only.
  *   THREAD_N/PHILOX_WIDTH Philox calls per (weight-row k, n_quarter) yield THREAD_N
  *   N(0,1) samples total — all ZO_TILE_M rows use the same z for the same weight
- *   (shared perturbation).  Register arrays v_cache_p/n[(I_DIM/ZO_TILE_N)*THREAD_N]
+ *   (shared perturbation). Register arrays v_cache_p/n[(I_DIM/ZO_TILE_N)*THREAD_N]
  *   accumulate the full GEMM output for both perturbations; SiLU is applied
  *   in-place after the loops.  Requires I % ZO_TILE_N == 0.
  *
  * Philox ILP:
  *   counter = k*(I/PHILOX_WIDTH) + n_start/PHILOX_WIDTH + n_quarter*(THREAD_N/PHILOX_WIDTH) + g
  *   uniquely addresses the g-th group-of-4 within thread n_quarter's THREAD_N columns.
- *   #pragma unroll 4 on the ki loop issues 4 independent counter chains (distinct k
- *   values → no data dependence); the GPU pipelines their 7-round multiply chains in
- *   parallel, hiding Philox latency behind itself.
  *
  * Compile: nvcc -arch=sm_89 -O2 fused_zo_example.cu -o fused_zo_example
  * Run:     ./fused_zo_example
@@ -53,18 +50,14 @@ inline void gpuAssert(cudaError_t code, const char *file, int line) {
 }
 
 // ============================================================================
-// Philox-4x32 counter-based PRNG (7 rounds)
-//
-// Why not a standard sequential RNG?  ZO optimization needs the same noise
-// vector z in both the forward kernel (to perturb each weight) and the update
-// kernel (to scale the gradient step).  A sequential RNG would require either
-// storing z (~d×I values) or replaying a stream from the beginning each time.
+// Philox-4x32 counter-based PRNG
 //
 // Philox is counter-based: given a (seed, counter) pair it produces
 // random-looking output via ~10 integer multiplications, with no sequential
-// state to maintain.  Any thread can independently evaluate any position in
-// the stream.  Both kernels derive the counter from (k, n) alone, so z is
-// regenerated on-the-fly without storage or inter-kernel coordination.
+// state to maintain. Any thread can independently evaluate any position in
+// the stream, without storing intermediate state. Both kernels derive the
+// counter from (k, n) alone, so z is regenerated on-the-fly without storage
+// or coordination.
 //
 // philox_uniform_4 — (seed, counter) → 4 uniform floats in [0, 1)
 // philox_normal_4  — Box-Muller pairs: (u0,u1)→(g0,g1), (u2,u3)→(g2,g3)
@@ -80,7 +73,6 @@ float4 philox_uniform_4(unsigned long long seed, unsigned long long counter)
                            (unsigned int)(counter >> 32), 0u, 0u);
     #pragma unroll
     for (int r = 0; r < 7; ++r) {
-        // Portable mul.hi: (a*b)>>32 — nvcc lowers this to mul.hi.u32 on device.
         unsigned int h0 = (unsigned int)(((unsigned long long)PSA * ctr.x) >> 32);
         unsigned int h1 = (unsigned int)(((unsigned long long)PSB * ctr.z) >> 32);
         ctr = make_uint4(h1 ^ ctr.y ^ key.x,  PSA * ctr.x,
@@ -95,11 +87,10 @@ __host__ __device__ __forceinline__
 float4 philox_normal_4(unsigned long long seed, unsigned long long counter)
 {
     float4 u = philox_uniform_4(seed, counter);
-    u.x = fmaxf(u.x, 1e-7f);  // avoid log(0); negligible distribution error
+    u.x = fmaxf(u.x, 1e-7f);  // avoid log(0) = inf
     u.z = fmaxf(u.z, 1e-7f);
     float r0 = sqrtf(-2.f * logf(u.x)), t0 = 6.28318530f * u.y;
     float r1 = sqrtf(-2.f * logf(u.z)), t1 = 6.28318530f * u.w;
-    // cosf/sinf: full-precision on host; maps to hardware trig on device.
     return make_float4(r0 * cosf(t0), r0 * sinf(t0),
                        r1 * cosf(t1), r1 * sinf(t1));
 }
@@ -107,18 +98,17 @@ float4 philox_normal_4(unsigned long long seed, unsigned long long counter)
 // ============================================================================
 // zo_fused_forward_kernel
 //
-// What is zeroth-order optimization?
-//   ZO estimates gradients without backpropagation.  It evaluates the loss at
-//   two slight weight perturbations — W+eps*z and W-eps*z — and estimates the
-//   gradient as (f+ - f-) / (2*eps).  This kernel computes BOTH perturbed
-//   forward passes in a single launch, loading inp and w_gate only once.
-//   Crucially, z is never stored; Philox regenerates it on-the-fly for each
-//   weight using the same counter formula as the update kernel.
+// MeZO estimates gradients without backpropagation.  It evaluates the loss at
+// two slight weight perturbations — W+eps*z and W-eps*z — and estimates the
+// gradient as (L(Φ(θ + εz, b)) - L(Φ(θ + εz, b))) / 2ε.
+//   
+// This kernel computes BOTH perturbed forward passes in a single launch,
+// loading inp and w only once. It also generates and does not materialize
+// the gaussian vector z, instead fusing ±εz into the weight loads.
 //
 // Computes both:
-//   out_pos = layernorm(silu(inp @ (W_gate + eps*z)))
-//   out_neg = layernorm(silu(inp @ (W_gate - eps*z)))
-// and accumulates MSE vs target into *loss_pos and *loss_neg.
+//   out_pos = layernorm(silu(inp @ (W + eps*z)))
+//   out_neg = layernorm(silu(inp @ (W - eps*z)))
 //
 // Thread assignment
 //   FWD_THREADS threads per block are arranged as a logical ZO_TILE_M × ZO_TPR grid:
@@ -141,11 +131,8 @@ float4 philox_normal_4(unsigned long long seed, unsigned long long counter)
 //   inp_tile_p [ZO_TILE_M × ZO_TILE_K floats] = 1 KB   + perturbation input
 //   inp_tile_n [ZO_TILE_M × ZO_TILE_K floats] = 1 KB   - perturbation input
 //   w_tile     [ZO_TILE_K × ZO_TILE_N halfs]  = 32 KB  weight strip (shared)
-//   smem2_p    [ZO_TILE_M*2 float2]           = 64 B   warp-leader stats for +
-//   smem2_n    [ZO_TILE_M*2 float2]           = 64 B   warp-leader stats for -
-//   warp_mse_p [ZO_TILE_M*2 float]            = 32 B   warp-leader MSE for +
-//   warp_mse_n [ZO_TILE_M*2 float]            = 32 B   warp-leader MSE for -
-//   Total: ~34.2 KB
+//   smem_red   [4 * FWD_THREADS floats]       = 4 KB   tree-reduce buffer (stats)
+//   Total: ~38 KB
 //
 // w_tile is stored as half (not float).  The dot-product access pattern reads
 // THREAD_N consecutive halves per thread, with a stride of THREAD_N between
@@ -224,80 +211,30 @@ float4 philox_normal_4(unsigned long long seed, unsigned long long counter)
 
 static_assert(THREAD_N % PHILOX_WIDTH == 0,
               "THREAD_N must be a multiple of PHILOX_WIDTH (philox_normal_4 output width)");
+static_assert((ZO_TPR & (ZO_TPR - 1)) == 0,
+              "ZO_TPR (= ZO_TILE_N / THREAD_N) must be a power of 2 (smem tree reduce)");
 
 // ---------------------------------------------------------------------------
-// Hyperparameter constraints
+// Constraints
 //
-// ZO_TPR == ZO_TILE_N / THREAD_N   (derived, not set directly)
-//   Thread decomposition t = m_local * ZO_TPR + n_quarter.  ZO_TILE_M rows,
-//   ZO_TPR threads/row.  Each thread owns THREAD_N consecutive output columns
-//   per N-tile, covering the full ZO_TILE_N column tile.
+// ZO_TPR % 2 == 0      (Tree reduce)
 //
-// FWD_THREADS == ZO_TILE_M * ZO_TPR   (derived)
-//   Total threads per block.  ZO_TILE_M rows × ZO_TPR threads/row.
-//   Changing TILE_N or THREAD_N automatically adjusts FWD_THREADS.
-//
-// ZO_TILE_K independent of ZO_TPR   (strided cooperative A-tile load)
-//   The A-tile [ZO_TILE_M × ZO_TILE_K] is loaded by the strided loop
-//     for (idx = t; idx < ZO_TILE_M*ZO_TILE_K; idx += FWD_THREADS)
-//   Any combination of tile sizes works; the loop handles partial coverage.
-//
-// ZO_TPR == 64   (warp-shuffle epilogue hardcodes 2 warps/row)
-//   Both stats and MSE reductions use smem2[m_local*2 + t_r/32] and
-//   warp_mse[m_local*2 + t_r/32].  This assumes exactly 2 warps per row.
-//   Changing ZO_TILE_N or THREAD_N such that ZO_TPR != 64 requires rewriting
-//   both epilogue reductions.
-//
-// THREAD_N % PHILOX_WIDTH == 0   (enforced by static_assert above)
-//   Each Philox call produces PHILOX_WIDTH=4 samples.  The inner g-loop runs
-//   THREAD_N/PHILOX_WIDTH times, consuming exactly THREAD_N samples total.
-//   Non-multiples would require a partial final call, wasting outputs and
-//   breaking counter alignment with zo_update_kernel.
-//   THREAD_N=PHILOX_WIDTH=4 is also bank-conflict-optimal (see w_tile note).
-//
-// I % ZO_TILE_N == 0   (checked in main)
-//   Column-direction bounds guards are absent in the N-tile loop, so w_gate
-//   and v_cache go out of bounds if I is not a multiple of ZO_TILE_N.  Also
-//   ensures n_start / PHILOX_WIDTH is exact, keeping the Philox counter lossless.
+// I % ZO_TILE_N == 0   (No partial tiles)
 //
 // ZO_TILE_K % 4 == 0   (Philox ILP)
-//   #pragma unroll 4 replicates the ki loop body 4 times, issuing 4
-//   independent Philox chains (distinct counters k*IQ+...).  If ZO_TILE_K
-//   is not divisible by 4, the compiler emits a remainder iteration whose
-//   counter is not independent of the preceding group.
 //
-// I_DIM == I at runtime   (v_cache compile-time size)
-//   float v_cache_p/n[(I_DIM/ZO_TILE_N)*THREAD_N] is compile-time sized.
-//   I_DIM must match the I passed to the kernel.
+// THREAD_N % PHILOX_WIDTH == 0   (Philox counter alignment)
 //
-// d % ZO_TILE_K: not required   (the check in main is overly conservative)
-//   A-tile and B-tile loads are guarded by (k < d), so partial K-tiles are
-//   correctly zero-padded.  The update kernel uses a flat linear group index
-//   independent of ZO_TILE_K, so partial tiles cause no Philox aliasing.
-//
-// Philox counter uniqueness
-//   counter = k*(I/PHILOX_WIDTH) + n_start/PHILOX_WIDTH
-//             + n_quarter*(THREAD_N/PHILOX_WIDTH) + g
-//   uniquely addresses each group of PHILOX_WIDTH weights.  The per-k offset
-//   n_start/PHILOX_WIDTH + n_quarter*(THREAD_N/PHILOX_WIDTH) + g is always
-//   < I/PHILOX_WIDTH, so no two weight rows share a counter.  Guaranteed once
-//   I % ZO_TILE_N == 0.  zo_update_kernel uses the same counter formula with
-//   group = k*(I/PHILOX_WIDTH) + n/PHILOX_WIDTH (linear group index).
-//
-// Hardware limits
-//   FWD_THREADS <= 1024 (max threads/block).
-//   shm_fwd ≈ 34 KB < 48 KB default; no cudaFuncSetAttribute needed.
+// I_DIM == I at runtime
+//   v_cache_p/n[(I_DIM/ZO_TILE_N)*THREAD_N] is compile-time sized.
 // ---------------------------------------------------------------------------
 
 __global__ void zo_fused_forward_kernel(
-    half       * __restrict__ out_pos,   // [B*M, I] output for W + eps*z
-    half       * __restrict__ out_neg,   // [B*M, I] output for W - eps*z
-    float      * __restrict__ loss_pos,  // MSE accumulator for + perturbation
-    float      * __restrict__ loss_neg,  // MSE accumulator for - perturbation
-    const half * __restrict__ inp_pos,   // [B, M, d] — input for + perturbation (ZO: same as inp_neg)
-    const half * __restrict__ inp_neg,   // [B, M, d] — input for - perturbation (ZO: same as inp_pos)
-    const half * __restrict__ w_gate,    // [d, I]
-    const half * __restrict__ target,    // [B*M, I]
+    half       * __restrict__ out_pos,   // [B, M, I] output for +eps
+    half       * __restrict__ out_neg,   // [B, M, I] output for -eps
+    const half * __restrict__ inp_pos,   // [B, M, d]
+    const half * __restrict__ inp_neg,   // [B, M, d]
+    const half * __restrict__ w,         // [d, I]
     const half * __restrict__ w_norm,    // [I]
     const half * __restrict__ b_norm,    // [I]
     int M, int d, int I,
@@ -308,10 +245,8 @@ __global__ void zo_fused_forward_kernel(
     float  *inp_tile_p = (float *)smem_raw;
     float  *inp_tile_n = inp_tile_p + ZO_TILE_M * ZO_TILE_K;
     half   *w_tile     = (half  *)(inp_tile_n + ZO_TILE_M * ZO_TILE_K);
-    float2 *smem2_p    = (float2 *)((char *)w_tile + ZO_TILE_K * ZO_TILE_N * sizeof(half));
-    float2 *smem2_n    = smem2_p   + ZO_TILE_M * 2;
-    float  *warp_mse_p = (float  *)(smem2_n   + ZO_TILE_M * 2);
-    float  *warp_mse_n = warp_mse_p + ZO_TILE_M * 2;
+    float  *smem_red   = (float *)((char *)w_tile + ZO_TILE_K * ZO_TILE_N * sizeof(half));
+    // smem_red[4 * FWD_THREADS]: per-thread stats (sum_p, sumsq_p, sum_n, sumsq_n).
 
     const int tile_row = blockIdx.x;
     const int batch    = blockIdx.y;
@@ -358,7 +293,7 @@ __global__ void zo_fused_forward_kernel(
             for (int idx = t; idx < ZO_TILE_K * ZO_TILE_N; idx += FWD_THREADS) {
                 int ki = idx / ZO_TILE_N, ni = idx % ZO_TILE_N;
                 int k  = k_start + ki;
-                w_tile[idx] = (k < d) ? __ldg(&w_gate[(size_t)k * I + n_start + ni])
+                w_tile[idx] = (k < d) ? __ldg(&w[(size_t)k * I + n_start + ni])
                                       : __float2half(0.f);
             }
             __syncthreads();
@@ -416,78 +351,53 @@ __global__ void zo_fused_forward_kernel(
         local_n.y += v * v;
     }
 
-    // Warp reduction for both perturbations simultaneously — one butterfly pass
-    // each, no extra cost over reducing a single value.
-    for (int s = 16; s > 0; s >>= 1) {
-        local_p.x += __shfl_xor_sync(0xffffffff, local_p.x, s);
-        local_p.y += __shfl_xor_sync(0xffffffff, local_p.y, s);
-        local_n.x += __shfl_xor_sync(0xffffffff, local_n.x, s);
-        local_n.y += __shfl_xor_sync(0xffffffff, local_n.y, s);
-    }
-    // Both warp leaders write in the same conditional; one __syncthreads() covers both.
-    if (t_r % 32 == 0) {
-        smem2_p[m_local * 2 + t_r / 32] = local_p;
-        smem2_n[m_local * 2 + t_r / 32] = local_n;
-    }
+    // Smem tree reduce across ZO_TPR threads per row, all 4 stats in parallel.
+    smem_red[t]                    = local_p.x;
+    smem_red[t +     FWD_THREADS]  = local_p.y;
+    smem_red[t + 2 * FWD_THREADS]  = local_n.x;
+    smem_red[t + 3 * FWD_THREADS]  = local_n.y;
     __syncthreads();
-    float2 agg_p = { smem2_p[m_local * 2].x + smem2_p[m_local * 2 + 1].x,
-                     smem2_p[m_local * 2].y + smem2_p[m_local * 2 + 1].y };
-    float2 agg_n = { smem2_n[m_local * 2].x + smem2_n[m_local * 2 + 1].x,
-                     smem2_n[m_local * 2].y + smem2_n[m_local * 2 + 1].y };
+    for (int stride = ZO_TPR >> 1; stride > 0; stride >>= 1) {
+        if (t_r < stride) {
+            smem_red[t]                   += smem_red[t + stride];
+            smem_red[t +     FWD_THREADS] += smem_red[t + stride +     FWD_THREADS];
+            smem_red[t + 2 * FWD_THREADS] += smem_red[t + stride + 2 * FWD_THREADS];
+            smem_red[t + 3 * FWD_THREADS] += smem_red[t + stride + 3 * FWD_THREADS];
+        }
+        __syncthreads();
+    }
+    const int row_base = m_local * ZO_TPR;
+    float2 agg_p = { smem_red[row_base],                   smem_red[row_base +     FWD_THREADS] };
+    float2 agg_n = { smem_red[row_base + 2 * FWD_THREADS], smem_red[row_base + 3 * FWD_THREADS] };
     float mean_p    = agg_p.x / I;
     float inv_std_p = rsqrtf(agg_p.y / I - mean_p * mean_p + LAYERNORM_EPS);
     float mean_n    = agg_n.x / I;
     float inv_std_n = rsqrtf(agg_n.y / I - mean_n * mean_n + LAYERNORM_EPS);
 
     // ----------------------------------------------------------------
-    // Step 3: normalize both outputs from v_cache; write both;
-    // accumulate MSE for each vs the shared target.
+    // Step 3: normalize both outputs from v_cache and write.
     // ----------------------------------------------------------------
-    float local_loss_p = 0.f, local_loss_n = 0.f;
     if (row < M) {
-        half       *out_row_p = out_pos + (size_t)(batch * M + row) * I;
-        half       *out_row_n = out_neg + (size_t)(batch * M + row) * I;
-        const half *tgt_row   = target  + (size_t)(batch * M + row) * I;
+        half *out_row_p = out_pos + (size_t)(batch * M + row) * I;
+        half *out_row_n = out_neg + (size_t)(batch * M + row) * I;
         for (int n_start = 0, ci = 0; n_start < I; n_start += ZO_TILE_N, ci += THREAD_N) {
             int n0 = n_start + n_quarter * THREAD_N;
             for (int j = 0; j < THREAD_N; ++j) {
                 float gamma_j = __half2float(__ldg(&w_norm[n0 + j]));
                 float beta_j  = __half2float(__ldg(&b_norm[n0 + j]));
-                float tgt_j   = __half2float(__ldg(&tgt_row[n0 + j]));
-                float vp = (v_cache_p[ci + j] - mean_p) * inv_std_p * gamma_j + beta_j;
-                float vn = (v_cache_n[ci + j] - mean_n) * inv_std_n * gamma_j + beta_j;
-                out_row_p[n0 + j] = __float2half(vp);
-                out_row_n[n0 + j] = __float2half(vn);
-                float ep = vp - tgt_j, en = vn - tgt_j;
-                local_loss_p += ep * ep;
-                local_loss_n += en * en;
+                out_row_p[n0 + j] = __float2half(
+                    (v_cache_p[ci + j] - mean_p) * inv_std_p * gamma_j + beta_j);
+                out_row_n[n0 + j] = __float2half(
+                    (v_cache_n[ci + j] - mean_n) * inv_std_n * gamma_j + beta_j);
             }
         }
-    }
-
-    // ----------------------------------------------------------------
-    // Step 4: reduce MSE partial sums for both perturbations simultaneously,
-    // then atomic-add each to its global accumulator.
-    // ----------------------------------------------------------------
-    for (int s = 16; s > 0; s >>= 1) {
-        local_loss_p += __shfl_xor_sync(0xffffffff, local_loss_p, s);
-        local_loss_n += __shfl_xor_sync(0xffffffff, local_loss_n, s);
-    }
-    if (t_r % 32 == 0) {
-        warp_mse_p[m_local * 2 + t_r / 32] = local_loss_p;
-        warp_mse_n[m_local * 2 + t_r / 32] = local_loss_n;
-    }
-    __syncthreads();
-    if (t_r == 0) {
-        atomicAdd(loss_pos, warp_mse_p[m_local * 2] + warp_mse_p[m_local * 2 + 1]);
-        atomicAdd(loss_neg, warp_mse_n[m_local * 2] + warp_mse_n[m_local * 2 + 1]);
     }
 }
 
 // ============================================================================
 // zo_update_kernel
 //
-// Applies:  W_gate[k, n] -= lr * grad_est * z[k, n]
+// Applies:  W[k, n] -= lr * grad_est * z[k, n]
 //
 // z is regenerated from the same (seed, counter) as zo_fused_forward:
 //   counter = k*(I/PHILOX_WIDTH) + n/PHILOX_WIDTH = group
@@ -503,7 +413,7 @@ __global__ void zo_fused_forward_kernel(
 #define UPD_THREADS 256
 
 __global__ void zo_update_kernel(
-    half * __restrict__ w_gate,  // [d, I], updated in-place
+    half * __restrict__ w,  // [d, I], updated in-place
     int d, int I,
     unsigned long long seed, float lr, float grad_est)
 {
@@ -514,42 +424,36 @@ __global__ void zo_update_kernel(
     float4 z4    = philox_normal_4(seed, (unsigned long long)group);
     float  scale = lr * grad_est;
 
-    half *w = w_gate + (size_t)group * PHILOX_WIDTH;
-    w[0] = __float2half(__half2float(w[0]) - scale * z4.x);
-    w[1] = __float2half(__half2float(w[1]) - scale * z4.y);
-    w[2] = __float2half(__half2float(w[2]) - scale * z4.z);
-    w[3] = __float2half(__half2float(w[3]) - scale * z4.w);
+    half *wp = w + (size_t)group * PHILOX_WIDTH;
+    wp[0] = __float2half(__half2float(wp[0]) - scale * z4.x);
+    wp[1] = __float2half(__half2float(wp[1]) - scale * z4.y);
+    wp[2] = __float2half(__half2float(wp[2]) - scale * z4.z);
+    wp[3] = __float2half(__half2float(wp[3]) - scale * z4.w);
 }
 
 // ============================================================================
 // CPU reference — dual-perturbed forward pass, matching zo_fused_forward_kernel.
 //
 // Computes, for each (batch, row):
-//   out_pos = layernorm(silu(inp_pos @ (W_gate + eps*z)))
-//   out_neg = layernorm(silu(inp_neg @ (W_gate - eps*z)))
-// and accumulates MSE vs target into *loss_pos / *loss_neg.
+//   out_pos = layernorm(silu(inp_pos @ (W + eps*z)))
+//   out_neg = layernorm(silu(inp_neg @ (W - eps*z)))
 //
 // z is regenerated from the same (seed, counter) formula as the GPU kernels:
 //   counter = k * (I/PHILOX_WIDTH) + n/PHILOX_WIDTH
 // so philox_normal_4(seed, counter)[j] gives z[k, n+j].
 // ============================================================================
 void cpu_reference(
-    float      *out_pos,    // [B*M, I]
-    float      *out_neg,    // [B*M, I]
-    float      *loss_pos,   // scalar, written (not accumulated into)
-    float      *loss_neg,   // scalar, written (not accumulated into)
+    float      *out_pos,    // [B, M, I]
+    float      *out_neg,    // [B, M, I]
     const half *inp_pos,    // [B, M, d]
     const half *inp_neg,    // [B, M, d]
-    const half *w_gate,     // [d, I]
-    const half *target,     // [B*M, I]
+    const half *w,          // [d, I]
     const half *w_norm,     // [I]
     const half *b_norm,     // [I]
     int B, int M, int d, int I,
     unsigned long long seed, float eps)
 {
-    const int IQ = I / PHILOX_WIDTH;  // groups of PHILOX_WIDTH per weight row
-    *loss_pos = 0.f;
-    *loss_neg = 0.f;
+    const int IQ = I / PHILOX_WIDTH;
     float *tmp_p = (float *)malloc(I * sizeof(float));
     float *tmp_n = (float *)malloc(I * sizeof(float));
     for (int b = 0; b < B; ++b) {
@@ -557,9 +461,7 @@ void cpu_reference(
         const half *inp_neg_b = inp_neg + (size_t)b * M * d;
         float      *out_pos_b = out_pos + (size_t)b * M * I;
         float      *out_neg_b = out_neg + (size_t)b * M * I;
-        const half *tgt_b     = target  + (size_t)b * M * I;
         for (int m = 0; m < M; ++m) {
-            // GEMM with perturbation — k-outer, n-inner (matches GPU loop order).
             for (int i = 0; i < I; ++i) tmp_p[i] = tmp_n[i] = 0.f;
             for (int k = 0; k < d; ++k) {
                 float iv_p = __half2float(inp_pos_b[m*d + k]);
@@ -570,22 +472,18 @@ void cpu_reference(
                     float4 z4 = philox_normal_4(seed, ctr);
                     float zv[PHILOX_WIDTH] = {z4.x, z4.y, z4.z, z4.w};
                     for (int j = 0; j < PHILOX_WIDTH; ++j) {
-                        float w = __half2float(w_gate[(size_t)k * I + n + j]);
-                        float p = eps * zv[j];
-                        tmp_p[n + j] += iv_p * (w + p);
-                        tmp_n[n + j] += iv_n * (w - p);
+                        float wval = __half2float(w[(size_t)k * I + n + j]);
+                        float p    = eps * zv[j];
+                        tmp_p[n + j] += iv_p * (wval + p);
+                        tmp_n[n + j] += iv_n * (wval - p);
                     }
                 }
             }
-            // SiLU in-place
-            for (int i = 0; i < I; ++i) {
-                float g = tmp_p[i]; tmp_p[i] = g / (1.f + expf(-g));
-                      g = tmp_n[i]; tmp_n[i] = g / (1.f + expf(-g));
-            }
-            // LayerNorm stats
             float sum_p = 0.f, sumsq_p = 0.f;
             float sum_n = 0.f, sumsq_n = 0.f;
             for (int i = 0; i < I; ++i) {
+                float g = tmp_p[i]; tmp_p[i] = g / (1.f + expf(-g));
+                      g = tmp_n[i]; tmp_n[i] = g / (1.f + expf(-g));
                 sum_p += tmp_p[i]; sumsq_p += tmp_p[i] * tmp_p[i];
                 sum_n += tmp_n[i]; sumsq_n += tmp_n[i] * tmp_n[i];
             }
@@ -593,21 +491,13 @@ void cpu_reference(
             float inv_std_p = 1.f / sqrtf(sumsq_p / I - mean_p * mean_p + LAYERNORM_EPS);
             float mean_n    = sum_n / I;
             float inv_std_n = 1.f / sqrtf(sumsq_n / I - mean_n * mean_n + LAYERNORM_EPS);
-            // Write outputs and accumulate MSE
-            float      *out_row_p = out_pos_b + (size_t)m * I;
-            float      *out_row_n = out_neg_b + (size_t)m * I;
-            const half *tgt_row   = tgt_b     + (size_t)m * I;
+            float *out_row_p = out_pos_b + (size_t)m * I;
+            float *out_row_n = out_neg_b + (size_t)m * I;
             for (int i = 0; i < I; ++i) {
                 float gamma = __half2float(w_norm[i]);
                 float beta  = __half2float(b_norm[i]);
-                float tgt   = __half2float(tgt_row[i]);
-                float vp = (tmp_p[i] - mean_p) * inv_std_p * gamma + beta;
-                float vn = (tmp_n[i] - mean_n) * inv_std_n * gamma + beta;
-                out_row_p[i] = vp;
-                out_row_n[i] = vn;
-                float ep = vp - tgt, en = vn - tgt;
-                *loss_pos += ep * ep;
-                *loss_neg += en * en;
+                out_row_p[i] = (tmp_p[i] - mean_p) * inv_std_p * gamma + beta;
+                out_row_n[i] = (tmp_n[i] - mean_n) * inv_std_n * gamma + beta;
             }
         }
     }
@@ -622,11 +512,6 @@ int main() {
 
     if (I % ZO_TILE_N != 0) {
         fprintf(stderr, "I (%d) must be divisible by ZO_TILE_N = %d\n", I, ZO_TILE_N);
-        return 1;
-    }
-    if (d % ZO_TILE_K != 0) {
-        fprintf(stderr, "d (%d) must be divisible by ZO_TILE_K = %d\n",
-                d, ZO_TILE_K);
         return 1;
     }
 
@@ -644,10 +529,10 @@ int main() {
 
     // Host arrays
     half  *h_inp         = (half *)malloc(n_inp  * sizeof(half));
-    half  *h_w_gate      = (half *)malloc(n_w    * sizeof(half));
+    half  *h_w           = (half *)malloc(n_w    * sizeof(half));
     half  *h_w_norm      = (half *)malloc(n_norm * sizeof(half));
     half  *h_b_norm      = (half *)malloc(n_norm * sizeof(half));
-    half  *h_target      = (half *)malloc(n_out  * sizeof(half));
+    half  *h_target      = (half *)malloc(n_out  * sizeof(half));  // for host-side MSE in Test 2
     half  *h_out_gpu     = (half *)malloc(n_out  * sizeof(half));
     float *h_out_ref_pos = (float*)malloc(n_out  * sizeof(float));
     float *h_out_ref_neg = (float*)malloc(n_out  * sizeof(float));
@@ -655,7 +540,7 @@ int main() {
 
     srand(42);
     for (int i = 0; i < n_inp;  ++i) h_inp[i]    = __float2half(randf_11());
-    for (int i = 0; i < n_w;    ++i) h_w_gate[i] = __float2half(randf_11());
+    for (int i = 0; i < n_w;    ++i) h_w[i]       = __float2half(randf_11());
     for (int i = 0; i < n_norm; ++i) {
         h_w_norm[i] = __float2half(randf_11());
         h_b_norm[i] = __float2half((float)rand()/(float)RAND_MAX * 0.2f - 0.1f);
@@ -663,29 +548,23 @@ int main() {
     for (int i = 0; i < n_out; ++i) h_target[i] = __float2half(randf_11());
 
     // Device arrays
-    half  *d_inp, *d_w_gate, *d_w_norm, *d_b_norm, *d_target;
-    half  *d_out_pos, *d_out_neg;
-    float *d_loss_pos, *d_loss_neg;
-    checkCuda(cudaMalloc(&d_inp,      n_inp  * sizeof(half)));
-    checkCuda(cudaMalloc(&d_w_gate,   n_w    * sizeof(half)));
-    checkCuda(cudaMalloc(&d_w_norm,   n_norm * sizeof(half)));
-    checkCuda(cudaMalloc(&d_b_norm,   n_norm * sizeof(half)));
-    checkCuda(cudaMalloc(&d_target,   n_out  * sizeof(half)));
-    checkCuda(cudaMalloc(&d_out_pos,  n_out  * sizeof(half)));
-    checkCuda(cudaMalloc(&d_out_neg,  n_out  * sizeof(half)));
-    checkCuda(cudaMalloc(&d_loss_pos, sizeof(float)));
-    checkCuda(cudaMalloc(&d_loss_neg, sizeof(float)));
+    half *d_inp, *d_w, *d_w_norm, *d_b_norm;
+    half *d_out_pos, *d_out_neg;
+    checkCuda(cudaMalloc(&d_inp,     n_inp  * sizeof(half)));
+    checkCuda(cudaMalloc(&d_w,       n_w    * sizeof(half)));
+    checkCuda(cudaMalloc(&d_w_norm,  n_norm * sizeof(half)));
+    checkCuda(cudaMalloc(&d_b_norm,  n_norm * sizeof(half)));
+    checkCuda(cudaMalloc(&d_out_pos, n_out  * sizeof(half)));
+    checkCuda(cudaMalloc(&d_out_neg, n_out  * sizeof(half)));
 
     checkCuda(cudaMemcpy(d_inp,    h_inp,    n_inp  * sizeof(half), cudaMemcpyHostToDevice));
-    checkCuda(cudaMemcpy(d_w_gate, h_w_gate, n_w    * sizeof(half), cudaMemcpyHostToDevice));
+    checkCuda(cudaMemcpy(d_w,      h_w,      n_w    * sizeof(half), cudaMemcpyHostToDevice));
     checkCuda(cudaMemcpy(d_w_norm, h_w_norm, n_norm * sizeof(half), cudaMemcpyHostToDevice));
     checkCuda(cudaMemcpy(d_b_norm, h_b_norm, n_norm * sizeof(half), cudaMemcpyHostToDevice));
-    checkCuda(cudaMemcpy(d_target, h_target, n_out  * sizeof(half), cudaMemcpyHostToDevice));
 
     const int shm_fwd = 2 * ZO_TILE_M * ZO_TILE_K * sizeof(float)   // inp_tile_p + inp_tile_n
                       + ZO_TILE_K * ZO_TILE_N * sizeof(half)          // w_tile (half)
-                      + 2 * ZO_TILE_M * 2 * sizeof(float2)            // smem2_p + smem2_n
-                      + 2 * ZO_TILE_M * 2 * sizeof(float);            // warp_mse_p + warp_mse_n
+                      + 4 * FWD_THREADS * sizeof(float);              // smem_red (stats)
     dim3 grid((M + ZO_TILE_M - 1) / ZO_TILE_M, B);
 
     // -----------------------------------------------------------------------
@@ -693,19 +572,16 @@ int main() {
     // -----------------------------------------------------------------------
     printf("\n[1] Correctness check (eps=0)\n");
 
-    checkCuda(cudaMemset(d_loss_pos, 0, sizeof(float)));
-    checkCuda(cudaMemset(d_loss_neg, 0, sizeof(float)));
     zo_fused_forward_kernel<<<grid, FWD_THREADS, shm_fwd>>>(
-        d_out_pos, d_out_neg, d_loss_pos, d_loss_neg,
-        d_inp, d_inp, d_w_gate, d_target, d_w_norm, d_b_norm,
+        d_out_pos, d_out_neg,
+        d_inp, d_inp, d_w, d_w_norm, d_b_norm,
         M, d, I, /*seed=*/0ULL, /*eps=*/0.f);
     checkCuda(cudaDeviceSynchronize());
 
     checkCuda(cudaMemcpy(h_out_gpu, d_out_pos, n_out * sizeof(half), cudaMemcpyDeviceToHost));
     for (int i = 0; i < n_out; ++i) h_out_f32[i] = __half2float(h_out_gpu[i]);
-    float ref_loss_pos, ref_loss_neg;
-    cpu_reference(h_out_ref_pos, h_out_ref_neg, &ref_loss_pos, &ref_loss_neg,
-                  h_inp, h_inp, h_w_gate, h_target, h_w_norm, h_b_norm,
+    cpu_reference(h_out_ref_pos, h_out_ref_neg,
+                  h_inp, h_inp, h_w, h_w_norm, h_b_norm,
                   B, M, d, I, /*seed=*/0ULL, /*eps=*/0.f);
 
     float abs_err = 0.f, max_ref = 0.f;
@@ -726,61 +602,68 @@ int main() {
     // Test 2: ZO gradient estimate and weight update
     //
     // MeZO estimate:  grad_est = (f+ - f-) / (2*eps)
-    // Weight update:  W_gate  -= lr * grad_est * z   (z regenerated from seed)
+    // Weight update:  W  -= lr * grad_est * z   (z regenerated from seed)
     // -----------------------------------------------------------------------
     printf("\n[2] ZO gradient estimate and update\n");
 
     const unsigned long long seed = 0xDEADBEEF42ULL;
-    const float eps = 1e-2f;
-    const float lr  = 1e-3f;
+    const float eps    = 1e-2f;
+    const float lr     = 1e-3f;
+    const float n_elems = (float)(B * M * I);
 
-    // Unperturbed loss before update
-    float h_loss_before;
-    checkCuda(cudaMemset(d_loss_pos, 0, sizeof(float)));
-    checkCuda(cudaMemset(d_loss_neg, 0, sizeof(float)));
+    // Host-side MSE helper: reads h_out_gpu (half) vs h_target (half).
+    auto host_mse = [&](const half *gpu_out) {
+        float s = 0.f;
+        for (int i = 0; i < n_out; ++i) {
+            float d = __half2float(gpu_out[i]) - __half2float(h_target[i]);
+            s += d * d;
+        }
+        return s;
+    };
+
+    // Unperturbed output before update → loss_before
     zo_fused_forward_kernel<<<grid, FWD_THREADS, shm_fwd>>>(
-        d_out_pos, d_out_neg, d_loss_pos, d_loss_neg,
-        d_inp, d_inp, d_w_gate, d_target, d_w_norm, d_b_norm,
+        d_out_pos, d_out_neg,
+        d_inp, d_inp, d_w, d_w_norm, d_b_norm,
         M, d, I, seed, 0.f);
     checkCuda(cudaDeviceSynchronize());
-    checkCuda(cudaMemcpy(&h_loss_before, d_loss_pos, sizeof(float), cudaMemcpyDeviceToHost));
+    checkCuda(cudaMemcpy(h_out_gpu, d_out_pos, n_out * sizeof(half), cudaMemcpyDeviceToHost));
+    float h_loss_before = host_mse(h_out_gpu);
 
-    // f+ and f- in one dual-perturbation kernel call — loads inp and w_gate once
-    float h_fpos, h_fneg;
-    checkCuda(cudaMemset(d_loss_pos, 0, sizeof(float)));
-    checkCuda(cudaMemset(d_loss_neg, 0, sizeof(float)));
+    // f+ and f- in one dual-perturbation kernel call — loads inp and w once
+    half *h_out_neg = (half *)malloc(n_out * sizeof(half));
     zo_fused_forward_kernel<<<grid, FWD_THREADS, shm_fwd>>>(
-        d_out_pos, d_out_neg, d_loss_pos, d_loss_neg,
-        d_inp, d_inp, d_w_gate, d_target, d_w_norm, d_b_norm,
+        d_out_pos, d_out_neg,
+        d_inp, d_inp, d_w, d_w_norm, d_b_norm,
         M, d, I, seed, eps);
     checkCuda(cudaDeviceSynchronize());
-    checkCuda(cudaMemcpy(&h_fpos, d_loss_pos, sizeof(float), cudaMemcpyDeviceToHost));
-    checkCuda(cudaMemcpy(&h_fneg, d_loss_neg, sizeof(float), cudaMemcpyDeviceToHost));
+    checkCuda(cudaMemcpy(h_out_gpu, d_out_pos, n_out * sizeof(half), cudaMemcpyDeviceToHost));
+    checkCuda(cudaMemcpy(h_out_neg, d_out_neg, n_out * sizeof(half), cudaMemcpyDeviceToHost));
+    float h_fpos = host_mse(h_out_gpu);
+    float h_fneg = host_mse(h_out_neg);
+    free(h_out_neg);
 
     float grad_est = (h_fpos - h_fneg) / (2.f * eps);
-    const float n_elems = (float)(B * M * I);
-    printf("  loss (unperturbed, before):          %.6f\n", h_loss_before / n_elems);
+    printf("  loss (unperturbed, before):        %.6f\n", h_loss_before / n_elems);
     printf("  [Φ(θ+εz,b) - Φ(θ-εz,b)] / 2ε:  %.6f\n", grad_est);
 
-    // Apply:  W_gate -= lr * grad_est * z  (z regenerated from seed)
-    int upd_groups = (d * I) / PHILOX_WIDTH;  // exact since I % PHILOX_WIDTH == 0
+    // Apply:  W -= lr * grad_est * z  (z regenerated from seed)
+    int upd_groups = (d * I) / PHILOX_WIDTH;
     int upd_blocks = (upd_groups + UPD_THREADS - 1) / UPD_THREADS;
     zo_update_kernel<<<upd_blocks, UPD_THREADS>>>(
-        d_w_gate, d, I, seed, lr, grad_est);
+        d_w, d, I, seed, lr, grad_est);
     checkCuda(cudaDeviceSynchronize());
 
-    // Unperturbed loss after update
-    float h_loss_after;
-    checkCuda(cudaMemset(d_loss_pos, 0, sizeof(float)));
-    checkCuda(cudaMemset(d_loss_neg, 0, sizeof(float)));
+    // Unperturbed output after update → loss_after
     zo_fused_forward_kernel<<<grid, FWD_THREADS, shm_fwd>>>(
-        d_out_pos, d_out_neg, d_loss_pos, d_loss_neg,
-        d_inp, d_inp, d_w_gate, d_target, d_w_norm, d_b_norm,
+        d_out_pos, d_out_neg,
+        d_inp, d_inp, d_w, d_w_norm, d_b_norm,
         M, d, I, seed, 0.f);
     checkCuda(cudaDeviceSynchronize());
-    checkCuda(cudaMemcpy(&h_loss_after, d_loss_pos, sizeof(float), cudaMemcpyDeviceToHost));
+    checkCuda(cudaMemcpy(h_out_gpu, d_out_pos, n_out * sizeof(half), cudaMemcpyDeviceToHost));
+    float h_loss_after = host_mse(h_out_gpu);
 
-    printf("  loss (unperturbed, after):  %.6f\n", h_loss_after / n_elems);
+    printf("  loss (unperturbed, after):         %.6f\n", h_loss_after / n_elems);
     printf("  delta: %+.6f  (%s)\n",
            (h_loss_after - h_loss_before) / n_elems,
            h_loss_after < h_loss_before ? "decreased" : "increased");
@@ -795,15 +678,15 @@ int main() {
     const int WARMUP = 5, RUNS = 50;
     for (int i = 0; i < WARMUP; ++i)
         zo_fused_forward_kernel<<<grid, FWD_THREADS, shm_fwd>>>(
-            d_out_pos, d_out_neg, d_loss_pos, d_loss_neg,
-            d_inp, d_inp, d_w_gate, d_target, d_w_norm, d_b_norm,
+            d_out_pos, d_out_neg,
+            d_inp, d_inp, d_w, d_w_norm, d_b_norm,
             M, d, I, seed, eps);
 
     cudaEventRecord(t0);
     for (int i = 0; i < RUNS; ++i)
         zo_fused_forward_kernel<<<grid, FWD_THREADS, shm_fwd>>>(
-            d_out_pos, d_out_neg, d_loss_pos, d_loss_neg,
-            d_inp, d_inp, d_w_gate, d_target, d_w_norm, d_b_norm,
+            d_out_pos, d_out_neg,
+            d_inp, d_inp, d_w, d_w_norm, d_b_norm,
             M, d, I, seed, eps);
     cudaEventRecord(t1);
     checkCuda(cudaDeviceSynchronize());
@@ -814,19 +697,18 @@ int main() {
     cudaEventRecord(t0);
     for (int i = 0; i < RUNS; ++i)
         zo_update_kernel<<<upd_blocks, UPD_THREADS>>>(
-            d_w_gate, d, I, seed, lr, grad_est);
+            d_w, d, I, seed, lr, grad_est);
     cudaEventRecord(t1);
     checkCuda(cudaDeviceSynchronize());
     cudaEventElapsedTime(&ms, t0, t1);
     printf("  zo_update:        %.4f ms/call (%d calls)\n", ms / RUNS, RUNS);
 
     // Cleanup
-    free(h_inp); free(h_w_gate); free(h_w_norm); free(h_b_norm);
+    free(h_inp); free(h_w); free(h_w_norm); free(h_b_norm);
     free(h_target); free(h_out_gpu);
     free(h_out_ref_pos); free(h_out_ref_neg); free(h_out_f32);
-    cudaFree(d_inp); cudaFree(d_w_gate); cudaFree(d_w_norm); cudaFree(d_b_norm);
-    cudaFree(d_target); cudaFree(d_out_pos); cudaFree(d_out_neg);
-    cudaFree(d_loss_pos); cudaFree(d_loss_neg);
+    cudaFree(d_inp); cudaFree(d_w); cudaFree(d_w_norm); cudaFree(d_b_norm);
+    cudaFree(d_out_pos); cudaFree(d_out_neg);
     cudaEventDestroy(t0); cudaEventDestroy(t1);
 
     return rel_err < 5e-3f ? 0 : 1;

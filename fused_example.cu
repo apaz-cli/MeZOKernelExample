@@ -46,10 +46,10 @@ inline void gpuAssert(cudaError_t code, const char *file, int line) {
 //
 // Grid:  dim3(ceil(M/TILE_M), B)
 //
-// Shared memory layout (~33 KB total):
-//   inp_tile [TILE_M × TILE_K floats]  input strip      (1 KB)
-//   w_tile   [TILE_K × TILE_N halfs]   weight strip     (32 KB)
-//   smem2    [TILE_M*2 float2]         warp-leader stats (64 B)
+// Shared memory layout (~35 KB total):
+//   inp_tile [TILE_M × TILE_K floats]      input strip      (1 KB)
+//   w_tile   [TILE_K × TILE_N halfs]       weight strip     (32 KB)
+//   smem_red [2 × BLOCK_THREADS floats]    tree-reduce buf  (2 KB)
 //
 // w_tile is stored as half: with THREAD_N=4 each thread reads four consecutive
 // halfs per ki step (stride-4 access), giving 2-way bank conflicts.  Storing
@@ -60,7 +60,7 @@ inline void gpuAssert(cudaError_t code, const char *file, int line) {
 //   1. Tiled GEMM (K-outer, N-inner): load inp strip once per K-tile; for each
 //      N-tile load the weight strip and accumulate THREAD_N partial dot products
 //      per thread into register array v_cache.
-//   2. SiLU in-place on v_cache; warp-shuffle reduction for per-row (Σv, Σv²).
+//   2. SiLU in-place on v_cache; smem tree reduce for per-row (Σv, Σv²).
 //   3. Normalize from v_cache; write fp16 output.
 // ---------------------------------------------------------------------------
 #define TILE_M        4
@@ -72,22 +72,10 @@ inline void gpuAssert(cudaError_t code, const char *file, int line) {
 #define LAYERNORM_EPS 1e-5f
 
 // ---------------------------------------------------------------------------
-// Hyperparameter constraints
+// Constraints
 //
-// BLOCK_THREADS == TILE_M * TILE_N / THREAD_N   (derived)
-//   Thread decomposition: m_local = t / (TILE_N/THREAD_N),
-//                         n_local = t % (TILE_N/THREAD_N).
-//   Block size follows from the tile dimensions; it is not set independently.
-//
-// TILE_N / THREAD_N == 64   (warp-shuffle epilogue hardcodes 2 warps/row)
-//   threads_per_row = TILE_N / THREAD_N must be 64 so that each row spans
-//   exactly 2 warps and smem2[m_local*2 + t_r/32] is correctly indexed.
-//   Changing this requires rewriting the epilogue reduction.
-//
-// TILE_K: free parameter, not constrained to equal TILE_N
-//   The A-tile is loaded as a strided cooperative loop over TILE_M×TILE_K
-//   elements; TILE_K can be set independently of TILE_N.  For efficiency,
-//   TILE_M×TILE_K should be a multiple of BLOCK_THREADS.
+// TILE_N / THREAD_N must be a power of 2   (smem tree reduce)
+//   The epilogue halves the active-thread count each step.
 //
 // I % TILE_N == 0
 //   The N-tile loop has no column-direction bounds guard.
@@ -100,11 +88,9 @@ inline void gpuAssert(cudaError_t code, const char *file, int line) {
 //
 // M % TILE_M: not required
 //   Output write is guarded by (row < M).
-//
-// Hardware limits
-//   BLOCK_THREADS <= 1024.
-//   shm_bytes ≈ 33 KB < 48 KB default; no cudaFuncSetAttribute needed.
 // ---------------------------------------------------------------------------
+static_assert(((TILE_N / THREAD_N) & (TILE_N / THREAD_N - 1)) == 0,
+              "TILE_N / THREAD_N must be a power of 2 (smem tree reduce)");
 
 __global__ void layernorm_silu_matmul_kernel(
     half       * __restrict__ out,
@@ -118,8 +104,9 @@ __global__ void layernorm_silu_matmul_kernel(
     extern __shared__ char smem_raw[];
     float  *inp_tile = (float *)smem_raw;
     half   *w_tile   = (half  *)(smem_raw + TILE_M * TILE_K * sizeof(float));
-    float2 *smem2    = (float2 *)(smem_raw + TILE_M * TILE_K * sizeof(float)
-                                           + TILE_K * TILE_N * sizeof(half));
+    float  *smem_red = (float *)(smem_raw + TILE_M * TILE_K * sizeof(float)
+                                          + TILE_K * TILE_N * sizeof(half));
+    // smem_red[0..BLOCK_THREADS) = per-thread Σv; smem_red[BLOCK_THREADS..2*) = per-thread Σv²
 
     const int tile_row        = blockIdx.x;
     const int batch           = blockIdx.y;
@@ -196,16 +183,19 @@ __global__ void layernorm_silu_matmul_kernel(
         local.y += v * v;
     }
 
-    // Warp-shuffle butterfly; each row spans exactly 2 warps (threads_per_row=64).
-    for (int s = 16; s > 0; s >>= 1) {
-        local.x += __shfl_xor_sync(0xffffffff, local.x, s);
-        local.y += __shfl_xor_sync(0xffffffff, local.y, s);
-    }
-    if (t_r % 32 == 0)
-        smem2[m_local * 2 + t_r / 32] = local;
+    // Smem tree reduce across threads_per_row threads per row.
+    smem_red[t]                = local.x;
+    smem_red[t + BLOCK_THREADS] = local.y;
     __syncthreads();
-    float2 agg    = { smem2[m_local * 2].x + smem2[m_local * 2 + 1].x,
-                      smem2[m_local * 2].y + smem2[m_local * 2 + 1].y };
+    for (int stride = threads_per_row >> 1; stride > 0; stride >>= 1) {
+        if (t_r < stride) {
+            smem_red[t]                += smem_red[t + stride];
+            smem_red[t + BLOCK_THREADS] += smem_red[t + stride + BLOCK_THREADS];
+        }
+        __syncthreads();
+    }
+    float2 agg = { smem_red[m_local * threads_per_row],
+                   smem_red[m_local * threads_per_row + BLOCK_THREADS] };
     float mean    = agg.x / I;
     float inv_std = rsqrtf(agg.y / I - mean * mean + LAYERNORM_EPS);
 
@@ -315,9 +305,9 @@ int main() {
     checkCuda(cudaMemcpy(d_w_norm, h_w_norm, n_norm * sizeof(half), cudaMemcpyHostToDevice));
     checkCuda(cudaMemcpy(d_b_norm, h_b_norm, n_norm * sizeof(half), cudaMemcpyHostToDevice));
 
-    const int shm_bytes = TILE_M * TILE_K * sizeof(float)   // inp_tile
-                        + TILE_K * TILE_N * sizeof(half)    // w_tile
-                        + TILE_M * 2 * sizeof(float2);      // smem2
+    const int shm_bytes = TILE_M * TILE_K * sizeof(float)      // inp_tile
+                        + TILE_K * TILE_N * sizeof(half)     // w_tile
+                        + 2 * BLOCK_THREADS * sizeof(float); // smem_red
     dim3 grid((M + TILE_M - 1) / TILE_M, B);
 
     // -----------------------------------------------------------------------
