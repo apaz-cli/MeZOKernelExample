@@ -1,6 +1,6 @@
 # ZOKernelExample
 
-An example implementation of a fused MeZO layernorm(silu(inp @ W_gate)) kernel.
+An example implementation of a fused MeZO `layernorm(silu(inp @ W ± εz))` kernel.
 
 The kernels are not meant to be used for production, but as examples of how to write ZO kernels.
 They are not written for any particular hardware generation and do not use any hardware features,

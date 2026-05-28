@@ -6,7 +6,7 @@
  *   out = layernorm(silu(inp @ W))
  * where
  *   inp    [B, M, d] — batch of M-row inputs
- *   W [d, I]    — shared weight, updated in-place
+ *   W      [d, I]    — shared weight, updated in-place
  *   out    [B, M, I] — batch outputs
  *
  * All batch samples share the same perturbation z ~ N(0,1) for W.
@@ -101,7 +101,7 @@ float4 philox_normal_4(unsigned long long seed, unsigned long long counter)
 // MeZO estimates gradients without backpropagation.  It evaluates the loss at
 // two slight weight perturbations — W+eps*z and W-eps*z — and estimates the
 // gradient as (L(Φ(θ + εz, b)) - L(Φ(θ + εz, b))) / 2ε.
-//   
+//
 // This kernel computes BOTH perturbed forward passes in a single launch,
 // loading inp and w only once. It also generates and does not materialize
 // the gaussian vector z, instead fusing ±εz into the weight loads.
